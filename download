@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+cache/
+backtest_results/
+.env
+*.log
+.DS_Store
+.idea/
+.vscode/
