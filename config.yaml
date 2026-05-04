@@ -40,11 +40,12 @@ bankroll:
   kelly_fraction: 0.25            # only used if sizing_model = 'kelly_fraction'
 
 frictions:
-  exchange: bybit                 # binance | bybit | okx
-                                  # Binance bloque les IPs US (GitHub Actions runners)
-                                  # → Bybit ou OKX recommandés
-  maker_fee_bps: 1.0              # Bybit USDT perp VIP0 maker
-  taker_fee_bps: 6.0              # Bybit USDT perp VIP0 taker
+  exchange: okx                   # binance | bybit | okx
+                                  # Binance + Bybit bloqués sur IPs GitHub Actions (US)
+                                  # OKX = dernière chance sur runner GitHub-hosted
+                                  # Si OKX échoue aussi → self-hosted runner obligatoire
+  maker_fee_bps: 2.0              # OKX USDT perp Lv1 maker
+  taker_fee_bps: 5.0              # OKX USDT perp Lv1 taker
 
 telegram:
   enabled: true
