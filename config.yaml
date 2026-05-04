@@ -40,9 +40,11 @@ bankroll:
   kelly_fraction: 0.25            # only used if sizing_model = 'kelly_fraction'
 
 frictions:
-  exchange: binance               # binance | bybit
-  maker_fee_bps: 2.0              # Binance USD-M VIP0
-  taker_fee_bps: 4.0
+  exchange: bybit                 # binance | bybit | okx
+                                  # Binance bloque les IPs US (GitHub Actions runners)
+                                  # → Bybit ou OKX recommandés
+  maker_fee_bps: 1.0              # Bybit USDT perp VIP0 maker
+  taker_fee_bps: 6.0              # Bybit USDT perp VIP0 taker
 
 telegram:
   enabled: true
