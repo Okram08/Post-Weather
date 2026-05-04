@@ -3,7 +3,7 @@
 Outputs to ./backtest_results/:
   - trades_<pair>.csv per pair
   - trades_all.csv combined portfolio
-  - summary.txt with metrics
+  - summary.txt with metrics + per-pair diagnostic
   - equity_curve.png
 
 Models real frictions:
@@ -16,7 +16,6 @@ Models real frictions:
 import argparse
 import pickle
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -162,14 +161,12 @@ def _simulate_trade(setup_ts, direction: str, row_4h: pd.Series,
     return t
 
 
-def _backtest_pair(pair: str, ohlc_1h: pd.DataFrame, funding: pd.DataFrame,
+def _backtest_pair(pair: str, ohlc_4h_full: pd.DataFrame,
+                   ohlc_1h: pd.DataFrame, funding: pd.DataFrame,
                    p: dict, fees: dict, sizing: dict) -> List[Trade]:
-    ohlc_4h = compute_indicators(resample_to_4h(ohlc_1h))
-    ohlc_4h = _attach_funding_4h(ohlc_4h, funding)
-
     trades = []
     blocked_until = pd.Timestamp("1970-01-01", tz="UTC")
-    for ts, row in ohlc_4h.iterrows():
+    for ts, row in ohlc_4h_full.iterrows():
         if ts < blocked_until:
             continue
         d = _detect_at(row, p)
@@ -184,8 +181,35 @@ def _backtest_pair(pair: str, ohlc_1h: pd.DataFrame, funding: pd.DataFrame,
     return trades
 
 
+def _diag_conditions(ohlc_4h: pd.DataFrame, p: dict) -> dict:
+    """Per-condition match counts to identify which filter is the bottleneck."""
+    valid = ohlc_4h.dropna(subset=["atr", "vwap_24h", "adx", "rsi",
+                                    "funding_rate", "extension_atr"])
+    n = len(valid)
+    if n == 0:
+        return {"valid_4h_bars": 0}
+    return {
+        "valid_4h_bars": n,
+        "n_range_adx": int((valid["adx"] < p["adx_max"]).sum()),
+        "n_oversold_rsi": int((valid["rsi"] < p["rsi_threshold"]).sum()),
+        "n_overbought_rsi": int((valid["rsi"] > 100 - p["rsi_threshold"]).sum()),
+        "n_ext_down": int((valid["extension_atr"] < -p["setup_atr_extension"]).sum()),
+        "n_ext_up": int((valid["extension_atr"] > p["setup_atr_extension"]).sum()),
+        "n_funding_neg": int((valid["funding_rate"] < p["funding_threshold"]).sum()),
+        "n_funding_pos": int((valid["funding_rate"] > -p["funding_threshold"]).sum()),
+        "funding_min": float(valid["funding_rate"].min()),
+        "funding_max": float(valid["funding_rate"].max()),
+        "funding_mean": float(valid["funding_rate"].mean()),
+        "rsi_min": float(valid["rsi"].min()),
+        "rsi_max": float(valid["rsi"].max()),
+        "ext_min": float(valid["extension_atr"].min()),
+        "ext_max": float(valid["extension_atr"].max()),
+        "adx_min": float(valid["adx"].min()),
+        "adx_max_seen": float(valid["adx"].max()),
+    }
+
+
 def _trades_df(trades: List[Trade]) -> pd.DataFrame:
-    """Returns a DataFrame with TRADE_COLUMNS, even if trades is empty."""
     if not trades:
         return pd.DataFrame(columns=TRADE_COLUMNS)
     return pd.DataFrame([{
@@ -261,8 +285,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", default="2023-01-01")
     parser.add_argument("--end", default="2025-12-31")
-    parser.add_argument("--pairs", default=None,
-                        help="comma-separated, defaults to config.yaml pairs")
+    parser.add_argument("--pairs", default=None)
     parser.add_argument("--setup_atr", type=float, default=None)
     parser.add_argument("--limit_atr", type=float, default=None)
     parser.add_argument("--stop_atr", type=float, default=None)
@@ -281,15 +304,11 @@ def main():
     pairs = (args.pairs.split(",") if args.pairs else cfg.strategy.pairs)
     pairs = [s.strip() for s in pairs]
 
-    fees = {
-        "maker_bps": cfg.frictions.maker_fee_bps,
-        "taker_bps": cfg.frictions.taker_fee_bps,
-    }
-    sizing = {
-        "initial_capital": cfg.bankroll.initial_capital_usd,
-        "risk_per_trade": cfg.bankroll.risk_per_trade_pct,
-        "max_leverage": cfg.bankroll.max_leverage,
-    }
+    fees = {"maker_bps": cfg.frictions.maker_fee_bps,
+            "taker_bps": cfg.frictions.taker_fee_bps}
+    sizing = {"initial_capital": cfg.bankroll.initial_capital_usd,
+              "risk_per_trade": cfg.bankroll.risk_per_trade_pct,
+              "max_leverage": cfg.bankroll.max_leverage}
 
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     cache = Path(args.cache_dir); cache.mkdir(parents=True, exist_ok=True)
@@ -304,6 +323,8 @@ def main():
     end_ms = int(pd.Timestamp(args.end, tz="UTC").timestamp() * 1000)
 
     all_trades = []
+    pair_diag = {}
+
     for pair in pairs:
         print(f"=== {pair} ===")
         cache_path = cache / f"{pair.replace('/','_').replace(':','_')}_{args.start}_{args.end}.pkl"
@@ -324,16 +345,24 @@ def main():
         n_funding = len(data["funding"])
         print(f"  → bars 1h: {n_bars}, funding rates: {n_funding}")
 
-        if n_bars == 0:
-            print(f"  ⚠️  no ohlcv data fetched, skipping")
-            continue
-        if n_funding == 0:
-            print(f"  ⚠️  no funding data fetched — Setup A funding condition will never trigger")
+        diag = {"bars_1h": n_bars, "funding_rates": n_funding,
+                "signals": 0, "filled": 0}
 
-        trades = _backtest_pair(pair, data["ohlc_1h"], data["funding"], p, fees, sizing)
-        n_signals = len(trades)
-        n_filled = sum(1 for t in trades if t.exit_reason != "unfilled")
-        print(f"  → signals detected: {n_signals}, filled: {n_filled}")
+        if n_bars == 0:
+            print("  ⚠️  no ohlcv data, skipping")
+            pair_diag[pair] = diag
+            continue
+
+        ohlc_4h = compute_indicators(resample_to_4h(data["ohlc_1h"]))
+        ohlc_4h = _attach_funding_4h(ohlc_4h, data["funding"])
+        diag.update(_diag_conditions(ohlc_4h, p))
+
+        trades = _backtest_pair(pair, ohlc_4h, data["ohlc_1h"], data["funding"],
+                                p, fees, sizing)
+        diag["signals"] = len(trades)
+        diag["filled"] = sum(1 for t in trades if t.exit_reason != "unfilled")
+        print(f"  → signals: {diag['signals']}, filled: {diag['filled']}")
+        print(f"  → diag: {diag}")
 
         df = _trades_df(trades)
         df.to_csv(out / f"trades_{pair.replace('/','_').replace(':','_')}.csv", index=False)
@@ -343,6 +372,7 @@ def main():
                   f"PnL ${m['total_pnl_usd']:.0f} ({m['total_return_pct']:.1%}), "
                   f"Sharpe {m['sharpe_annualized']:.2f}, DD {m['max_drawdown_pct']:.1%}")
         all_trades.extend(trades)
+        pair_diag[pair] = diag
         print()
 
     portfolio = _trades_df(all_trades)
@@ -356,12 +386,38 @@ def main():
                      f"period   : {args.start} → {args.end}",
                      f"pairs    : {', '.join(pairs)}",
                      f"params   : {p}", ""]
+
+    summary_lines.append("PER-PAIR DIAGNOSTIC")
+    summary_lines.append("-" * 40)
+    for pair, d in pair_diag.items():
+        summary_lines.append(f"{pair}")
+        summary_lines.append(f"  bars 1h         : {d.get('bars_1h', 0)}")
+        summary_lines.append(f"  funding rates   : {d.get('funding_rates', 0)}")
+        summary_lines.append(f"  valid 4h bars   : {d.get('valid_4h_bars', 0)}")
+        summary_lines.append(f"  ADX < {p['adx_max']}        : {d.get('n_range_adx', 0)}")
+        summary_lines.append(f"  RSI < {p['rsi_threshold']}      : {d.get('n_oversold_rsi', 0)}")
+        summary_lines.append(f"  RSI > {100-p['rsi_threshold']:.0f}      : {d.get('n_overbought_rsi', 0)}")
+        summary_lines.append(f"  ext < -{p['setup_atr_extension']}     : {d.get('n_ext_down', 0)}")
+        summary_lines.append(f"  ext > +{p['setup_atr_extension']}     : {d.get('n_ext_up', 0)}")
+        summary_lines.append(f"  funding < {p['funding_threshold']}: {d.get('n_funding_neg', 0)}")
+        summary_lines.append(f"  funding > {-p['funding_threshold']}: {d.get('n_funding_pos', 0)}")
+        if "funding_min" in d:
+            summary_lines.append(f"  funding range   : [{d['funding_min']:.6f}, {d['funding_max']:.6f}], mean {d['funding_mean']:.6f}")
+            summary_lines.append(f"  ext range       : [{d['ext_min']:.2f}, {d['ext_max']:.2f}]")
+            summary_lines.append(f"  RSI range       : [{d['rsi_min']:.1f}, {d['rsi_max']:.1f}]")
+        summary_lines.append(f"  signals         : {d.get('signals', 0)}")
+        summary_lines.append(f"  filled          : {d.get('filled', 0)}")
+        summary_lines.append("")
+    summary_lines.append("-" * 40)
+    summary_lines.append("")
+
     if metrics.get("total_signals", 0) == 0:
-        summary_lines.append("⚠️  Aucun signal détecté sur la période.")
-        summary_lines.append("Causes probables :")
-        summary_lines.append("  - funding rates non fetchés (vérifier nb funding par paire ci-dessus)")
-        summary_lines.append("  - paramètres trop stricts (extension/rsi/funding_threshold)")
-        summary_lines.append("  - période sans condition de marché matching")
+        summary_lines.append("⚠️  Aucun signal détecté.")
+        summary_lines.append("Lis le bloc PER-PAIR DIAGNOSTIC ci-dessus :")
+        summary_lines.append("  - si funding rates = 0 → pb fetch funding (OKX pagination)")
+        summary_lines.append("  - si funding range proche de [0, 0] → fetch retourne du vide")
+        summary_lines.append("  - si n_funding_neg/pos = 0 mais range OK → seuil trop strict")
+        summary_lines.append("  - si une seule condition a 0 match → on relax celle-là")
     else:
         for k, v in metrics.items():
             if isinstance(v, float):
