@@ -1,11 +1,14 @@
-"""Exchange OHLCV + funding rate fetcher (live + historical)."""
+"""Exchange OHLCV + funding rate fetcher (live + historical).
+
+Supports: binance, bybit, okx (USDT-margined perpetual swaps).
+"""
 import time
 
 import ccxt
 import pandas as pd
 
 
-def make_exchange(name: str = "binance"):
+def make_exchange(name: str = "bybit"):
     if name == "binance":
         return ccxt.binance({
             "options": {"defaultType": "swap"},
@@ -13,6 +16,11 @@ def make_exchange(name: str = "binance"):
         })
     if name == "bybit":
         return ccxt.bybit({
+            "options": {"defaultType": "swap"},
+            "enableRateLimit": True,
+        })
+    if name == "okx":
+        return ccxt.okx({
             "options": {"defaultType": "swap"},
             "enableRateLimit": True,
         })
@@ -42,18 +50,29 @@ def fetch_current_funding(exchange, symbol: str) -> float:
 # ---- Historical paginated (for backtests) ----
 
 def fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str,
-                          since_ms: int, end_ms: int) -> pd.DataFrame:
+                          since_ms: int, end_ms: int,
+                          max_errors: int = 5) -> pd.DataFrame:
+    """Fetch OHLCV in chunks. Aborts after `max_errors` consecutive failures
+    to prevent infinite retry loops on persistent errors (e.g. geo-block)."""
     all_bars = []
+    errors = 0
     while since_ms < end_ms:
         try:
             bars = exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=1000)
+            errors = 0  # reset on success
             if not bars:
                 break
             all_bars.extend(bars)
             since_ms = bars[-1][0] + 1
             time.sleep(exchange.rateLimit / 1000)
         except Exception as e:
-            print(f"  retry ohlcv: {e}")
+            errors += 1
+            print(f"  retry ohlcv {errors}/{max_errors}: {e}")
+            if errors >= max_errors:
+                raise RuntimeError(
+                    f"Aborted ohlcv fetch after {max_errors} consecutive errors. "
+                    f"Last error: {e}"
+                )
             time.sleep(2)
     if not all_bars:
         return pd.DataFrame()
@@ -64,18 +83,28 @@ def fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str,
 
 
 def fetch_funding_paginated(exchange, symbol: str,
-                            since_ms: int, end_ms: int) -> pd.DataFrame:
+                            since_ms: int, end_ms: int,
+                            max_errors: int = 5) -> pd.DataFrame:
+    """Fetch funding rate history in chunks. Same retry cap as ohlcv."""
     all_rates = []
+    errors = 0
     while since_ms < end_ms:
         try:
             rates = exchange.fetch_funding_rate_history(symbol, since=since_ms, limit=1000)
+            errors = 0  # reset on success
             if not rates:
                 break
             all_rates.extend(rates)
             since_ms = rates[-1]["timestamp"] + 1
             time.sleep(exchange.rateLimit / 1000)
         except Exception as e:
-            print(f"  retry funding: {e}")
+            errors += 1
+            print(f"  retry funding {errors}/{max_errors}: {e}")
+            if errors >= max_errors:
+                raise RuntimeError(
+                    f"Aborted funding fetch after {max_errors} consecutive errors. "
+                    f"Last error: {e}"
+                )
             time.sleep(2)
     if not all_rates:
         return pd.DataFrame()
