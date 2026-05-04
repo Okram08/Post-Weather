@@ -6,7 +6,7 @@ Outputs to ./backtest_results/:
   - summary.txt with metrics
   - equity_curve.png
 
-CRITICAL: this backtest models REAL frictions:
+Models real frictions:
   - Maker fees on limit fills + target exits
   - Taker fees on stop and time exits
   - Funding payments every 8h while in position
@@ -29,6 +29,13 @@ from src.data import (
     make_exchange, fetch_ohlcv_paginated, fetch_funding_paginated,
 )
 from src.indicators import resample_to_4h, compute_indicators
+
+
+TRADE_COLUMNS = [
+    "pair", "direction", "setup_time", "fill_time", "exit_time",
+    "exit_reason", "limit", "stop", "target", "exit_price",
+    "pnl_usd", "fees", "funding", "size_usd",
+]
 
 
 @dataclass
@@ -114,7 +121,7 @@ def _simulate_trade(setup_ts, direction: str, row_4h: pd.Series,
 
     for ts, bar in post.iloc[1:].iterrows():
         if direction == "long":
-            if bar["low"] <= stop:  # stop checked first (conservative)
+            if bar["low"] <= stop:
                 t.exit_time, t.exit_price, t.exit_reason = ts, stop, "stop"; break
             if bar["high"] >= target:
                 t.exit_time, t.exit_price, t.exit_reason = ts, target, "target"; break
@@ -128,7 +135,6 @@ def _simulate_trade(setup_ts, direction: str, row_4h: pd.Series,
         t.exit_price = post["close"].iloc[-1]
         t.exit_reason = "time"
 
-    # Sizing
     risk_dist_pct = abs(limit - stop) / limit
     notional = sizing["initial_capital"] * sizing["risk_per_trade"] / max(risk_dist_pct, 1e-6)
     notional = min(notional, sizing["initial_capital"] * sizing["max_leverage"])
@@ -179,6 +185,9 @@ def _backtest_pair(pair: str, ohlc_1h: pd.DataFrame, funding: pd.DataFrame,
 
 
 def _trades_df(trades: List[Trade]) -> pd.DataFrame:
+    """Returns a DataFrame with TRADE_COLUMNS, even if trades is empty."""
+    if not trades:
+        return pd.DataFrame(columns=TRADE_COLUMNS)
     return pd.DataFrame([{
         "pair": t.pair, "direction": t.direction,
         "setup_time": t.setup_time, "fill_time": t.fill_time,
@@ -193,12 +202,12 @@ def _trades_df(trades: List[Trade]) -> pd.DataFrame:
 
 def _metrics(df: pd.DataFrame, initial_capital: float) -> dict:
     if df.empty:
-        return {}
+        return {"total_signals": 0, "filled": 0, "fill_rate": 0.0}
     filled = df[df["exit_reason"] != "unfilled"].copy()
     out = {
         "total_signals": len(df),
         "filled": len(filled),
-        "fill_rate": len(filled) / len(df),
+        "fill_rate": len(filled) / len(df) if len(df) > 0 else 0.0,
     }
     if filled.empty:
         return out
@@ -233,6 +242,8 @@ def _metrics(df: pd.DataFrame, initial_capital: float) -> dict:
 
 
 def _plot_equity(df: pd.DataFrame, initial_capital: float, out_path: Path):
+    if df.empty:
+        return
     filled = df[df["exit_reason"] != "unfilled"].copy().sort_values("exit_time")
     if filled.empty:
         return
@@ -283,49 +294,82 @@ def main():
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     cache = Path(args.cache_dir); cache.mkdir(parents=True, exist_ok=True)
 
+    print(f"\nExchange: {cfg.frictions.exchange}")
+    print(f"Pairs:    {pairs}")
+    print(f"Period:   {args.start} → {args.end}")
+    print(f"Params:   {p}\n")
+
     exchange = make_exchange(cfg.frictions.exchange)
     since_ms = int(pd.Timestamp(args.start, tz="UTC").timestamp() * 1000)
     end_ms = int(pd.Timestamp(args.end, tz="UTC").timestamp() * 1000)
 
     all_trades = []
     for pair in pairs:
-        print(f"\n=== {pair} ===")
+        print(f"=== {pair} ===")
         cache_path = cache / f"{pair.replace('/','_').replace(':','_')}_{args.start}_{args.end}.pkl"
         if cache_path.exists():
+            print(f"  loading cache: {cache_path.name}")
             with open(cache_path, "rb") as f:
                 data = pickle.load(f)
         else:
-            print("  fetching ohlcv...")
+            print("  fetching ohlcv 1h...")
             ohlc_1h = fetch_ohlcv_paginated(exchange, pair, "1h", since_ms, end_ms)
             print("  fetching funding...")
             funding = fetch_funding_paginated(exchange, pair, since_ms, end_ms)
             data = {"ohlc_1h": ohlc_1h, "funding": funding}
             with open(cache_path, "wb") as f:
                 pickle.dump(data, f)
-        if data["ohlc_1h"].empty:
-            print("  no data, skip"); continue
+
+        n_bars = len(data["ohlc_1h"])
+        n_funding = len(data["funding"])
+        print(f"  → bars 1h: {n_bars}, funding rates: {n_funding}")
+
+        if n_bars == 0:
+            print(f"  ⚠️  no ohlcv data fetched, skipping")
+            continue
+        if n_funding == 0:
+            print(f"  ⚠️  no funding data fetched — Setup A funding condition will never trigger")
+
         trades = _backtest_pair(pair, data["ohlc_1h"], data["funding"], p, fees, sizing)
+        n_signals = len(trades)
+        n_filled = sum(1 for t in trades if t.exit_reason != "unfilled")
+        print(f"  → signals detected: {n_signals}, filled: {n_filled}")
+
         df = _trades_df(trades)
         df.to_csv(out / f"trades_{pair.replace('/','_').replace(':','_')}.csv", index=False)
         m = _metrics(df, sizing["initial_capital"])
         if m.get("filled", 0) > 0:
-            print(f"  {m['total_signals']} signals, {m['filled']} filled "
-                  f"({m['fill_rate']:.0%}), win_rate={m['win_rate']:.1%}")
-            print(f"  PnL ${m['total_pnl_usd']:.0f} ({m['total_return_pct']:.1%}), "
+            print(f"  win_rate={m['win_rate']:.1%}, "
+                  f"PnL ${m['total_pnl_usd']:.0f} ({m['total_return_pct']:.1%}), "
                   f"Sharpe {m['sharpe_annualized']:.2f}, DD {m['max_drawdown_pct']:.1%}")
         all_trades.extend(trades)
+        print()
 
-    portfolio = _trades_df(all_trades).sort_values("setup_time").reset_index(drop=True)
+    portfolio = _trades_df(all_trades)
+    if not portfolio.empty:
+        portfolio = portfolio.sort_values("setup_time").reset_index(drop=True)
     portfolio.to_csv(out / "trades_all.csv", index=False)
     metrics = _metrics(portfolio, sizing["initial_capital"])
 
-    summary = ["PORTFOLIO METRICS", "=" * 40]
-    summary += [f"period: {args.start} → {args.end}",
-                f"pairs : {', '.join(pairs)}",
-                f"params: {p}", ""]
-    for k, v in metrics.items():
-        summary.append(f"{k:30s}: {v:.4f}" if isinstance(v, float) else f"{k:30s}: {v}")
-    text = "\n".join(summary)
+    summary_lines = ["PORTFOLIO METRICS", "=" * 40,
+                     f"exchange : {cfg.frictions.exchange}",
+                     f"period   : {args.start} → {args.end}",
+                     f"pairs    : {', '.join(pairs)}",
+                     f"params   : {p}", ""]
+    if metrics.get("total_signals", 0) == 0:
+        summary_lines.append("⚠️  Aucun signal détecté sur la période.")
+        summary_lines.append("Causes probables :")
+        summary_lines.append("  - funding rates non fetchés (vérifier nb funding par paire ci-dessus)")
+        summary_lines.append("  - paramètres trop stricts (extension/rsi/funding_threshold)")
+        summary_lines.append("  - période sans condition de marché matching")
+    else:
+        for k, v in metrics.items():
+            if isinstance(v, float):
+                summary_lines.append(f"{k:30s}: {v:.4f}")
+            else:
+                summary_lines.append(f"{k:30s}: {v}")
+
+    text = "\n".join(summary_lines)
     print("\n" + text)
     (out / "summary.txt").write_text(text)
     _plot_equity(portfolio, sizing["initial_capital"], out / "equity_curve.png")
