@@ -1,0 +1,93 @@
+name: Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start date (YYYY-MM-DD)'
+        required: true
+        default: '2023-01-01'
+      end_date:
+        description: 'End date (YYYY-MM-DD)'
+        required: true
+        default: '2025-12-31'
+      pairs:
+        description: 'Pairs (comma-separated, ex: BTC/USDT:USDT,ETH/USDT:USDT)'
+        required: false
+        default: ''
+      setup_atr:
+        description: 'Setup ATR extension threshold (override)'
+        required: false
+        default: ''
+      limit_atr:
+        description: 'Limit order extension (override)'
+        required: false
+        default: ''
+      target_pct:
+        description: 'Target % (override, ex: 0.01)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - run: pip install -r requirements.txt
+
+      - name: Build args
+        id: args
+        run: |
+          ARGS="--start ${{ inputs.start_date }} --end ${{ inputs.end_date }}"
+          if [ -n "${{ inputs.pairs }}" ]; then ARGS="$ARGS --pairs ${{ inputs.pairs }}"; fi
+          if [ -n "${{ inputs.setup_atr }}" ]; then ARGS="$ARGS --setup_atr ${{ inputs.setup_atr }}"; fi
+          if [ -n "${{ inputs.limit_atr }}" ]; then ARGS="$ARGS --limit_atr ${{ inputs.limit_atr }}"; fi
+          if [ -n "${{ inputs.target_pct }}" ]; then ARGS="$ARGS --target_pct ${{ inputs.target_pct }}"; fi
+          echo "args=$ARGS" >> $GITHUB_OUTPUT
+
+      - name: Run backtest
+        run: python -m src.backtest ${{ steps.args.outputs.args }}
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results-${{ github.run_id }}
+          path: backtest_results/
+          retention-days: 30
+
+      - name: Send summary to Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python <<'PY'
+          import os, requests
+          from pathlib import Path
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat = os.environ.get("TELEGRAM_CHAT_ID", "")
+          if not (token and chat):
+              print("[telegram] missing creds"); exit(0)
+          summary_path = Path("backtest_results/summary.txt")
+          summary = summary_path.read_text() if summary_path.exists() else "No summary produced."
+          if len(summary) > 3500:
+              summary = summary[:3500] + "\n... (truncated)"
+          msg = f"📊 *Backtest done*\n\n```\n{summary}\n```"
+          r = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              json={"chat_id": chat, "text": msg, "parse_mode": "Markdown"},
+              timeout=10,
+          )
+          print(r.status_code, r.text[:200])
+          PY

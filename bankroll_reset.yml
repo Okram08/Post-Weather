@@ -1,0 +1,97 @@
+name: Reset bankroll state
+
+on:
+  workflow_dispatch:
+    inputs:
+      new_equity:
+        description: 'New equity in USD (overrides current state)'
+        required: true
+        default: '10000'
+      reason:
+        description: 'Reason for reset (audit log)'
+        required: true
+        default: 'manual reset'
+      clear_open_positions:
+        description: 'Also clear any open positions tracked in state?'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - run: pip install -r requirements.txt
+
+      - name: Reset bankroll
+        env:
+          GIST_PAT: ${{ secrets.GIST_PAT }}
+          GIST_STATE_ID: ${{ secrets.GIST_STATE_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEW_EQUITY: ${{ inputs.new_equity }}
+          REASON: ${{ inputs.reason }}
+          CLEAR_OPEN: ${{ inputs.clear_open_positions }}
+        run: |
+          python <<'PY'
+          import os, json
+          from datetime import datetime, timezone
+          from src.state import GistState
+
+          gist = GistState(os.environ["GIST_PAT"], os.environ["GIST_STATE_ID"])
+          new_eq = float(os.environ["NEW_EQUITY"])
+          reason = os.environ["REASON"]
+          clear_open = os.environ["CLEAR_OPEN"].lower() == "true"
+
+          existing = gist.read("bankroll.json") or {}
+          now = datetime.now(timezone.utc).isoformat()
+          new_state = {
+              "equity_usd": new_eq,
+              "peak_equity_usd": new_eq,
+              "daily_pnl_usd": 0.0,
+              "daily_reset_at": now,
+              "open_positions": [] if clear_open else existing.get("open_positions", []),
+              "halted": False,
+              "halt_reason": "",
+              "last_updated": now,
+          }
+          gist.write("bankroll.json", new_state)
+          gist.append_log("audit_log.json", {
+              "event": "bankroll_reset",
+              "previous_equity": existing.get("equity_usd"),
+              "new_equity": new_eq,
+              "previous_halted": existing.get("halted", False),
+              "previous_halt_reason": existing.get("halt_reason", ""),
+              "cleared_open_positions": clear_open,
+              "reason": reason,
+          })
+          print(f"Reset OK: ${new_eq:.2f}")
+
+          # Notify Telegram
+          import requests
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat = os.environ.get("TELEGRAM_CHAT_ID", "")
+          if token and chat:
+              msg = (
+                  f"🔄 *Bankroll reset*\n"
+                  f"Equity: `${new_eq:,.2f}`\n"
+                  f"Reason: `{reason}`\n"
+                  f"Cleared open positions: `{clear_open}`"
+              )
+              requests.post(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  json={"chat_id": chat, "text": msg, "parse_mode": "Markdown"},
+                  timeout=10,
+              )
+          PY

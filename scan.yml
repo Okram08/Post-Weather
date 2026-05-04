@@ -1,0 +1,38 @@
+name: Scan signals
+
+on:
+  # Every 4h aligned with Binance funding settlements
+  # 00:01, 04:01, 08:01, 12:01, 16:01, 20:01 UTC
+  schedule:
+    - cron: '1 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIST_PAT: ${{ secrets.GIST_PAT }}
+          GIST_STATE_ID: ${{ secrets.GIST_STATE_ID }}
+        run: python -m src.scanner
