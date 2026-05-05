@@ -1,4 +1,4 @@
-"""Backtest engine for Setup A v2 — runs on GitHub Actions (workflow_dispatch).
+"""Backtest engine for Setup A v2 - runs on GitHub Actions (workflow_dispatch).
 
 Supports two target modes (configured in config.yaml under setup_a.target_mode):
   - 'vwap'      : target = VWAP (proper mean-reversion target). Recommended.
@@ -473,4 +473,28 @@ def main():
             summary_lines.append("  funding range   : [{:.6f}, {:.6f}]".format(
                 d["funding_min"], d["funding_max"]))
         summary_lines.append("  signals         : " + str(d.get("signals", 0)))
-        summary_
+        summary_lines.append("  filled          : " + str(d.get("filled", 0)))
+        summary_lines.append("")
+    summary_lines.append("-" * 40)
+    summary_lines.append("")
+
+    if metrics.get("total_signals", 0) == 0:
+        summary_lines.append("[WARN] No signals detected.")
+    else:
+        for k, v in metrics.items():
+            if isinstance(v, float):
+                summary_lines.append("{:30s}: {:.4f}".format(k, v))
+            else:
+                summary_lines.append("{:30s}: {}".format(k, v))
+
+    text = "\n".join(summary_lines)
+    print("")
+    print(text)
+    (out / "summary.txt").write_text(text)
+    _plot_equity(portfolio, sizing["initial_capital"], out / "equity_curve.png")
+    print("")
+    print("-> results in " + str(out) + "/")
+
+
+if __name__ == "__main__":
+    main()
