@@ -1,7 +1,7 @@
 # crypto-trading-bot configuration
-# Validated parameters from 3-month backtest on Hyperliquid:
-#   total_signals=29, filled=7, win_rate=71.4%, Sharpe 5.4, DD -1%
-# Note: small sample, expect real-world Sharpe 1.5-2.5
+# Live test phase, $100 bankroll on Hyperliquid
+# Validated params from backtest: 71% win rate, Sharpe 5.4 over 3 months
+# Note: small live bankroll requires 2% risk to keep notional > $10 (HL min)
 
 strategy:
   pairs:
@@ -10,42 +10,38 @@ strategy:
     - "SOL/USDC:USDC"
 
   setup_a:
-    # Detection thresholds (on 4h bar close) - VALIDATED
-    setup_atr_extension: 1.0      # |close - vwap_24h| / atr > 1.0
-    rsi_threshold: 40.0           # RSI_4h < 40 long, > 60 short
-    adx_max: 30.0                 # ADX < 30 = range regime
-    funding_threshold: -0.00001   # 8h-equiv: -0.00008 (very mild crowding)
+    setup_atr_extension: 1.0
+    rsi_threshold: 40.0
+    adx_max: 30.0
+    funding_threshold: -0.00001
 
-    # Limit order placement
     limit_extension_atr: 2.5
 
-    # Risk management
     stop_atr: 1.5
-    target_mode: vwap             # mean-reversion target
-    target_pct: 0.01              # unused when target_mode=vwap
+    target_mode: vwap
+    target_pct: 0.01
 
-    # Time controls
     limit_validity_hours: 8
     position_max_hours: 48
 
 bankroll:
-  # PAPER TRADING / MICRO LIVE config
-  initial_capital_usd: 500.0      # start small for live validation
-  risk_per_trade_pct: 0.005       # 0.5% per trade (conservative)
-  max_concurrent_positions: 1     # 1 at a time during validation phase
+  initial_capital_usd: 100.0
+  risk_per_trade_pct: 0.02        # 2% of $100 = $2 max loss per trade
+                                  # notional ~= $67 (above HL $10 min)
+  max_concurrent_positions: 1     # 1 at a time during validation
   max_leverage: 3.0
 
-  # Circuit breakers
-  daily_loss_limit_pct: 0.03
-  max_drawdown_pct: 0.10          # tightened to -10% for validation
+  # Circuit breakers - tighter for small live bankroll
+  daily_loss_limit_pct: 0.05      # -5% in 24h -> halt 24h ($5)
+  max_drawdown_pct: 0.20          # -20% from peak -> halt ($20)
 
   sizing_model: fixed
   kelly_fraction: 0.25
 
 frictions:
   exchange: hyperliquid
-  maker_fee_bps: 1.0              # HL standard maker
-  taker_fee_bps: 3.5              # HL standard taker
+  maker_fee_bps: 1.0
+  taker_fee_bps: 3.5
 
 telegram:
   enabled: true
