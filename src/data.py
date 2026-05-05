@@ -2,12 +2,7 @@
 
 Supports: binance, bybit, okx, hyperliquid.
 
-Hyperliquid quirks:
-  - USDC-margined perps (BTC/USDC:USDC, not USDT)
-  - Funding paid hourly (not 8h)
-  - OHLCV: API may return fewer bars than requested limit; advance by last bar
-    timestamp, and jump by chunk_window only when API returns ZERO bars
-    (to skip pre-listing periods)
+v4: detailed timestamp diagnostic per fetch call to understand HL behavior.
 """
 import time
 
@@ -15,7 +10,7 @@ import ccxt
 import pandas as pd
 
 
-_DATA_PY_VERSION = "v3-hl-pagination-fix-20260505"
+_DATA_PY_VERSION = "v4-hl-timestamp-diag-20260505"
 
 
 TIMEFRAME_MS = {
@@ -65,33 +60,27 @@ def fetch_current_funding(exchange, symbol: str) -> float:
         return 0.0
 
 
+def _ts_str(ms):
+    return str(pd.Timestamp(ms, unit='ms', tz='UTC'))
+
+
 def fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str,
                           since_ms: int, end_ms: int,
                           max_errors: int = 5) -> pd.DataFrame:
-    """Fetch OHLCV in chunks. Aborts after `max_errors` consecutive failures.
-
-    Logic:
-      - If API returns bars: advance cursor to (last_bar_ts + 1 timeframe).
-      - If API returns NO bars: jump forward by skip_window (to skip pre-listing).
-      - Stop when cursor passes end_ms or we get 3 empty results in a row past
-        the listing date.
-    """
+    """Fetch OHLCV in chunks, with detailed per-call timestamp logging."""
     print("  [data.py " + _DATA_PY_VERSION + "] fetch_ohlcv_paginated: "
           + symbol + " " + timeframe
-          + " from=" + str(pd.Timestamp(since_ms, unit='ms', tz='UTC'))
-          + " to=" + str(pd.Timestamp(end_ms, unit='ms', tz='UTC')))
+          + " requested from=" + _ts_str(since_ms) + " to=" + _ts_str(end_ms))
 
     all_bars = []
     errors = 0
     is_hl = exchange.id == "hyperliquid"
     tf_ms = TIMEFRAME_MS.get(timeframe, 60 * 60 * 1000)
 
-    # Per-call limit
     chunk_limit = 5000 if is_hl else 1000
-    # Skip window when no bars returned (used only for HL to skip pre-listing)
-    skip_window_ms = 30 * 24 * 60 * 60 * 1000  # 30 days
+    skip_window_ms = 30 * 24 * 60 * 60 * 1000
     consecutive_empty = 0
-    max_consecutive_empty = 6  # allow up to 6 months of empty before giving up
+    max_consecutive_empty = 6
 
     cursor_ms = since_ms
     iteration = 0
@@ -103,32 +92,34 @@ def fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str,
 
             if bars and len(bars) > 0:
                 consecutive_empty = 0
-                all_bars.extend(bars)
+                # DIAGNOSTIC: log first and last bar timestamp returned
+                first_ts = bars[0][0]
                 last_ts = bars[-1][0]
-                # Always advance by last_ts + 1 timeframe (never skip valid data)
+                print("    iter " + str(iteration)
+                      + " cursor_req=" + _ts_str(cursor_ms)
+                      + " got " + str(len(bars)) + " bars"
+                      + " range=[" + _ts_str(first_ts) + " ... " + _ts_str(last_ts) + "]")
+
+                # If the API ignored our `since` and returned bars from far in the future
+                # (e.g. when since is before listing), we must not loop forever.
+                if first_ts > end_ms:
+                    print("    -> all returned bars are AFTER end_ms; stopping")
+                    break
+
+                all_bars.extend(bars)
                 new_cursor = last_ts + tf_ms
                 if new_cursor <= cursor_ms:
-                    # Defensive: if API returned bars before our since, force advance
                     new_cursor = cursor_ms + tf_ms * chunk_limit
                 cursor_ms = new_cursor
-                if iteration % 5 == 0:
-                    print("    iter " + str(iteration) + ": "
-                          + str(len(all_bars)) + " bars cumul, cursor="
-                          + str(pd.Timestamp(cursor_ms, unit='ms', tz='UTC')))
             else:
-                # Empty response
                 consecutive_empty += 1
+                print("    iter " + str(iteration) + " cursor_req=" + _ts_str(cursor_ms)
+                      + " EMPTY (consecutive=" + str(consecutive_empty) + ")")
                 if not is_hl:
-                    # For non-HL exchanges, empty = end of data, stop
                     break
-                # For HL: skip forward to find first available data
                 if consecutive_empty >= max_consecutive_empty:
-                    print("    " + str(consecutive_empty) + " consecutive empty responses, stopping")
                     break
                 cursor_ms += skip_window_ms
-                print("    empty response (consecutive=" + str(consecutive_empty)
-                      + "), skipping +30d to "
-                      + str(pd.Timestamp(cursor_ms, unit='ms', tz='UTC')))
 
             time.sleep(exchange.rateLimit / 1000)
         except Exception as e:
@@ -141,26 +132,31 @@ def fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str,
                 )
             time.sleep(2)
 
-    print("    [done] total bars fetched: " + str(len(all_bars)))
+    print("    [done] total bars fetched (raw): " + str(len(all_bars)))
 
     if not all_bars:
         return pd.DataFrame()
     df = pd.DataFrame(all_bars, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df = df.drop_duplicates("ts").set_index("ts").sort_index()
-    return df[df.index <= pd.Timestamp(end_ms, unit="ms", tz="UTC")]
+
+    print("    [done] after dedup: " + str(len(df)) + " bars,"
+          + " range=[" + str(df.index.min()) + " ... " + str(df.index.max()) + "]")
+
+    df_clipped = df[df.index <= pd.Timestamp(end_ms, unit="ms", tz="UTC")]
+    print("    [done] after clip <= end_ms: " + str(len(df_clipped)) + " bars")
+
+    return df_clipped
 
 
 def fetch_funding_paginated(exchange, symbol: str,
                             since_ms: int, end_ms: int,
                             max_errors: int = 5) -> pd.DataFrame:
-    """Fetch funding rate history. Same advance logic as ohlcv."""
     print("  [data.py " + _DATA_PY_VERSION + "] fetch_funding_paginated: " + symbol)
 
     all_rates = []
     errors = 0
     is_hl = exchange.id == "hyperliquid"
-    # Funding interval (1h on HL, 8h on others)
     funding_interval_ms = 60 * 60 * 1000 if is_hl else 8 * 60 * 60 * 1000
     chunk_limit = 500 if is_hl else 1000
     skip_window_ms = 30 * 24 * 60 * 60 * 1000
@@ -168,15 +164,27 @@ def fetch_funding_paginated(exchange, symbol: str,
     max_consecutive_empty = 6
 
     cursor_ms = since_ms
+    iteration = 0
     while cursor_ms < end_ms:
+        iteration += 1
         try:
             rates = exchange.fetch_funding_rate_history(symbol, since=cursor_ms, limit=chunk_limit)
             errors = 0
 
             if rates and len(rates) > 0:
                 consecutive_empty = 0
-                all_rates.extend(rates)
+                first_ts = rates[0]["timestamp"]
                 last_ts = rates[-1]["timestamp"]
+                if iteration <= 3 or iteration % 10 == 0:
+                    print("    funding iter " + str(iteration)
+                          + " cursor_req=" + _ts_str(cursor_ms)
+                          + " got " + str(len(rates)) + " rates"
+                          + " range=[" + _ts_str(first_ts) + " ... " + _ts_str(last_ts) + "]")
+
+                if first_ts > end_ms:
+                    break
+
+                all_rates.extend(rates)
                 new_cursor = last_ts + funding_interval_ms
                 if new_cursor <= cursor_ms:
                     new_cursor = cursor_ms + funding_interval_ms * chunk_limit
@@ -209,4 +217,7 @@ def fetch_funding_paginated(exchange, symbol: str,
          "funding_rate": r["fundingRate"]}
         for r in all_rates
     ])
-    return df.drop_duplicates("ts").set_index("ts").sort_index()
+    df = df.drop_duplicates("ts").set_index("ts").sort_index()
+    print("    [done] funding after dedup: " + str(len(df))
+          + " range=[" + str(df.index.min()) + " ... " + str(df.index.max()) + "]")
+    return df
