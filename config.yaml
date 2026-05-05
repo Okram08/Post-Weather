@@ -1,7 +1,5 @@
 # crypto-trading-bot configuration
-# Live test phase, $100 bankroll on Hyperliquid
-# Validated params from backtest: 71% win rate, Sharpe 5.4 over 3 months
-# Note: small live bankroll requires 2% risk to keep notional > $10 (HL min)
+# Live test phase, $100 bankroll on Hyperliquid (Perps)
 
 strategy:
   pairs:
@@ -26,22 +24,21 @@ strategy:
 
 bankroll:
   initial_capital_usd: 100.0
-  risk_per_trade_pct: 0.02        # 2% of $100 = $2 max loss per trade
-                                  # notional ~= $67 (above HL $10 min)
-  max_concurrent_positions: 1     # 1 at a time during validation
+  risk_per_trade_pct: 0.02
+  max_concurrent_positions: 1
   max_leverage: 3.0
 
-  # Circuit breakers - tighter for small live bankroll
-  daily_loss_limit_pct: 0.05      # -5% in 24h -> halt 24h ($5)
-  max_drawdown_pct: 0.20          # -20% from peak -> halt ($20)
+  daily_loss_limit_pct: 0.05
+  max_drawdown_pct: 0.20
 
   sizing_model: fixed
   kelly_fraction: 0.25
 
 frictions:
   exchange: hyperliquid
-  maker_fee_bps: 1.0
-  taker_fee_bps: 3.5
+  # Real fees from your HL account (visible in Portfolio screen):
+  maker_fee_bps: 1.44             # 0.0144% maker
+  taker_fee_bps: 4.32             # 0.0432% taker
 
 telegram:
   enabled: true
