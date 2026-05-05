@@ -1,5 +1,9 @@
 """Backtest engine for Setup A v2 — runs on GitHub Actions (workflow_dispatch).
 
+Supports two target modes (configured in config.yaml under setup_a.target_mode):
+  - 'vwap'      : target = VWAP (proper mean-reversion target). Recommended.
+  - 'fixed_pct' : target = limit ± target_pct (simple fixed % target).
+
 Auto-detects if funding data is dense enough; if not, runs with the funding
 condition disabled and logs the fallback explicitly.
 
@@ -32,8 +36,6 @@ TRADE_COLUMNS = [
     "pnl_usd", "fees", "funding", "size_usd",
 ]
 
-# If less than this fraction of 4h bars has non-zero funding,
-# fallback to the no-funding setup variant.
 FUNDING_DENSITY_MIN = 0.5
 
 
@@ -66,7 +68,6 @@ def _attach_funding_4h(ohlc_4h: pd.DataFrame, funding: pd.DataFrame) -> pd.DataF
 
 
 def _funding_density(ohlc_4h: pd.DataFrame) -> float:
-    """Fraction of 4h bars that have a non-zero funding rate after attach."""
     if "funding_rate" not in ohlc_4h.columns or len(ohlc_4h) == 0:
         return 0.0
     nz = (ohlc_4h["funding_rate"].abs() > 1e-9).sum()
@@ -95,18 +96,31 @@ def _detect_at(row: pd.Series, p: dict, use_funding: bool) -> Optional[str]:
     return None
 
 
+def _compute_levels(direction: str, vwap: float, atr: float, p: dict):
+    """Returns (limit, stop, target) according to target_mode."""
+    target_mode = p.get("target_mode", "fixed_pct")
+    if direction == "long":
+        limit = vwap - p["limit_extension_atr"] * atr
+        stop = limit - p["stop_atr"] * atr
+        if target_mode == "vwap":
+            target = vwap
+        else:
+            target = limit * (1 + p["target_pct"])
+    else:
+        limit = vwap + p["limit_extension_atr"] * atr
+        stop = limit + p["stop_atr"] * atr
+        if target_mode == "vwap":
+            target = vwap
+        else:
+            target = limit * (1 - p["target_pct"])
+    return limit, stop, target
+
+
 def _simulate_trade(setup_ts, direction: str, row_4h: pd.Series,
                     ohlc_1h: pd.DataFrame, funding: pd.DataFrame,
                     p: dict, fees: dict, sizing: dict, pair: str) -> Trade:
     vwap, atr = row_4h["vwap_24h"], row_4h["atr"]
-    if direction == "long":
-        limit = vwap - p["limit_extension_atr"] * atr
-        stop = limit - p["stop_atr"] * atr
-        target = limit * (1 + p["target_pct"])
-    else:
-        limit = vwap + p["limit_extension_atr"] * atr
-        stop = limit + p["stop_atr"] * atr
-        target = limit * (1 - p["target_pct"])
+    limit, stop, target = _compute_levels(direction, vwap, atr, p)
 
     t = Trade(pair=pair, direction=direction, setup_time=setup_ts,
               limit_price=limit, stop_price=stop, target_price=target)
@@ -214,7 +228,6 @@ def _diag_conditions(ohlc_4h: pd.DataFrame, p: dict) -> dict:
         "funding_density": _funding_density(valid),
         "funding_min": float(valid["funding_rate"].min()),
         "funding_max": float(valid["funding_rate"].max()),
-        "funding_mean": float(valid["funding_rate"].mean()),
         "rsi_min": float(valid["rsi"].min()),
         "rsi_max": float(valid["rsi"].max()),
         "ext_min": float(valid["extension_atr"].min()),
@@ -303,8 +316,10 @@ def main():
     parser.add_argument("--limit_atr", type=float, default=None)
     parser.add_argument("--stop_atr", type=float, default=None)
     parser.add_argument("--target_pct", type=float, default=None)
+    parser.add_argument("--target_mode", default=None,
+                        help="Override target_mode: vwap | fixed_pct")
     parser.add_argument("--force_no_funding", action="store_true",
-                        help="Force run without funding filter (overrides auto-detect)")
+                        help="Force run without funding filter")
     parser.add_argument("--cache_dir", default="cache")
     parser.add_argument("--output_dir", default="backtest_results")
     args = parser.parse_args()
@@ -315,6 +330,8 @@ def main():
     if args.limit_atr is not None: p["limit_extension_atr"] = args.limit_atr
     if args.stop_atr is not None: p["stop_atr"] = args.stop_atr
     if args.target_pct is not None: p["target_pct"] = args.target_pct
+    if args.target_mode is not None: p["target_mode"] = args.target_mode
+    p.setdefault("target_mode", "fixed_pct")  # backward compat
 
     pairs = (args.pairs.split(",") if args.pairs else cfg.strategy.pairs)
     pairs = [s.strip() for s in pairs]
@@ -331,6 +348,7 @@ def main():
     print(f"\nExchange: {cfg.frictions.exchange}")
     print(f"Pairs:    {pairs}")
     print(f"Period:   {args.start} → {args.end}")
+    print(f"Target mode: {p['target_mode']}")
     print(f"Params:   {p}\n")
 
     exchange = make_exchange(cfg.frictions.exchange)
@@ -374,20 +392,18 @@ def main():
         ohlc_4h = _attach_funding_4h(ohlc_4h, data["funding"])
         diag.update(_diag_conditions(ohlc_4h, p))
 
-        # Auto-detect funding usability
         density = diag.get("funding_density", 0.0)
         if args.force_no_funding:
             use_funding = False
-            mode = "FORCED OFF (--force_no_funding)"
+            mode = "FORCED OFF"
         elif density >= FUNDING_DENSITY_MIN:
             use_funding = True
             mode = f"ON (density {density:.1%})"
         else:
             use_funding = False
-            mode = f"AUTO-OFF (density {density:.1%} < {FUNDING_DENSITY_MIN:.0%})"
+            mode = f"AUTO-OFF (density {density:.1%})"
         print(f"  → funding filter: {mode}")
         funding_modes[pair] = mode
-        diag["funding_filter"] = mode
 
         trades = _backtest_pair(pair, ohlc_4h, data["ohlc_1h"], data["funding"],
                                 p, fees, sizing, use_funding)
@@ -413,10 +429,11 @@ def main():
     metrics = _metrics(portfolio, sizing["initial_capital"])
 
     summary_lines = ["PORTFOLIO METRICS", "=" * 40,
-                     f"exchange : {cfg.frictions.exchange}",
-                     f"period   : {args.start} → {args.end}",
-                     f"pairs    : {', '.join(pairs)}",
-                     f"params   : {p}", ""]
+                     f"exchange     : {cfg.frictions.exchange}",
+                     f"period       : {args.start} → {args.end}",
+                     f"target mode  : {p['target_mode']}",
+                     f"pairs        : {', '.join(pairs)}",
+                     f"params       : {p}", ""]
 
     summary_lines.append("FUNDING FILTER MODE PER PAIR")
     summary_lines.append("-" * 40)
@@ -432,11 +449,6 @@ def main():
         summary_lines.append(f"  funding rates   : {d.get('funding_rates', 0)}")
         summary_lines.append(f"  funding density : {d.get('funding_density', 0.0):.1%}")
         summary_lines.append(f"  valid 4h bars   : {d.get('valid_4h_bars', 0)}")
-        summary_lines.append(f"  ADX < {p['adx_max']}        : {d.get('n_range_adx', 0)}")
-        summary_lines.append(f"  RSI < {p['rsi_threshold']}      : {d.get('n_oversold_rsi', 0)}")
-        summary_lines.append(f"  RSI > {100-p['rsi_threshold']:.0f}      : {d.get('n_overbought_rsi', 0)}")
-        summary_lines.append(f"  ext < -{p['setup_atr_extension']}     : {d.get('n_ext_down', 0)}")
-        summary_lines.append(f"  ext > +{p['setup_atr_extension']}     : {d.get('n_ext_up', 0)}")
         summary_lines.append(f"  signals         : {d.get('signals', 0)}")
         summary_lines.append(f"  filled          : {d.get('filled', 0)}")
         summary_lines.append("")
@@ -444,7 +456,7 @@ def main():
     summary_lines.append("")
 
     if metrics.get("total_signals", 0) == 0:
-        summary_lines.append("⚠️  Aucun signal — relax les params ou vérifie données.")
+        summary_lines.append("⚠️  Aucun signal détecté.")
     else:
         for k, v in metrics.items():
             if isinstance(v, float):
