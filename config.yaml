@@ -24,7 +24,7 @@ strategy:
 
     # Time controls
     limit_validity_hours: 8       # cancel if not filled in 8h
-    position_max_hours: 48        # close at market after 48h (was 12, too tight for VWAP target)
+    position_max_hours: 48        # close at market after 48h
 
 bankroll:
   initial_capital_usd: 10000.0
