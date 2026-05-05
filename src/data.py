@@ -1,27 +1,29 @@
 """Exchange OHLCV + funding rate fetcher.
 
-Supports: binance, bybit, okx, hyperliquid.
+Supports: binance, bybit, okx (via ccxt), hyperliquid (via direct REST API).
 
-v4: detailed timestamp diagnostic per fetch call to understand HL behavior.
+ccxt's Hyperliquid OHLCV implementation IGNORES the `since` parameter and
+returns only the last ~5000 bars. We bypass ccxt for HL OHLCV and use the
+official /info endpoint with candleSnapshot which respects startTime/endTime.
+
+Funding history works correctly via ccxt for HL, so we keep that.
 """
 import time
 
 import ccxt
 import pandas as pd
+import requests
 
 
-_DATA_PY_VERSION = "v4-hl-timestamp-diag-20260505"
+_DATA_PY_VERSION = "v5-hl-direct-api-20260505"
 
 
-TIMEFRAME_MS = {
-    "1m": 60 * 1000,
-    "5m": 5 * 60 * 1000,
-    "15m": 15 * 60 * 1000,
-    "30m": 30 * 60 * 1000,
-    "1h": 60 * 60 * 1000,
-    "4h": 4 * 60 * 60 * 1000,
-    "1d": 24 * 60 * 60 * 1000,
-}
+HL_API_URL = "https://api.hyperliquid.xyz/info"
+
+
+# Map ccxt symbol "BTC/USDC:USDC" to HL coin name "BTC"
+def _hl_coin(symbol: str) -> str:
+    return symbol.split("/")[0]
 
 
 def make_exchange(name: str = "bybit"):
@@ -38,6 +40,12 @@ def make_exchange(name: str = "bybit"):
 
 
 def fetch_ohlcv_recent(exchange, symbol: str, timeframe: str, n_bars: int = 300) -> pd.DataFrame:
+    if exchange.id == "hyperliquid":
+        # Use direct API for consistency with paginated version
+        end_ms = int(time.time() * 1000)
+        tf_ms = _tf_to_ms(timeframe)
+        start_ms = end_ms - n_bars * tf_ms
+        return _hl_fetch_ohlcv_direct(symbol, timeframe, start_ms, end_ms)
     bars = exchange.fetch_ohlcv(symbol, timeframe, limit=n_bars)
     if not bars:
         return pd.DataFrame()
@@ -60,67 +68,130 @@ def fetch_current_funding(exchange, symbol: str) -> float:
         return 0.0
 
 
+def _tf_to_ms(timeframe: str) -> int:
+    mapping = {
+        "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+        "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
+    }
+    return mapping.get(timeframe, 3_600_000)
+
+
 def _ts_str(ms):
     return str(pd.Timestamp(ms, unit='ms', tz='UTC'))
+
+
+def _hl_fetch_ohlcv_direct(symbol: str, timeframe: str,
+                            start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Direct Hyperliquid /info candleSnapshot API.
+
+    HL caps each call to 5000 candles; we paginate by sliding the start time.
+    """
+    coin = _hl_coin(symbol)
+    tf_ms = _tf_to_ms(timeframe)
+    chunk_candles = 5000
+    chunk_window_ms = chunk_candles * tf_ms
+
+    all_bars = []
+    cursor = start_ms
+    iteration = 0
+    consecutive_empty = 0
+
+    while cursor < end_ms:
+        iteration += 1
+        req_end = min(cursor + chunk_window_ms, end_ms)
+        payload = {
+            "type": "candleSnapshot",
+            "req": {
+                "coin": coin,
+                "interval": timeframe,
+                "startTime": cursor,
+                "endTime": req_end,
+            },
+        }
+        try:
+            resp = requests.post(HL_API_URL, json=payload, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print("  [HL ohlcv] error iter " + str(iteration) + ": " + str(e))
+            time.sleep(2)
+            continue
+
+        if not data:
+            consecutive_empty += 1
+            if iteration <= 3 or iteration % 5 == 0:
+                print("    HL iter " + str(iteration)
+                      + " req=[" + _ts_str(cursor) + " ... " + _ts_str(req_end) + "]"
+                      + " EMPTY (consecutive=" + str(consecutive_empty) + ")")
+            if consecutive_empty >= 6:
+                print("    -> 6 consecutive empty, stopping")
+                break
+            cursor = req_end
+            continue
+
+        consecutive_empty = 0
+        for c in data:
+            # HL candle format: {"t": startTime, "T": endTime, "s": coin, "i": interval,
+            #                    "o": open, "h": high, "l": low, "c": close, "v": volume, "n": trades}
+            all_bars.append([
+                int(c["t"]),
+                float(c["o"]),
+                float(c["h"]),
+                float(c["l"]),
+                float(c["c"]),
+                float(c["v"]),
+            ])
+
+        last_ts = int(data[-1]["t"])
+        if iteration <= 3 or iteration % 5 == 0:
+            print("    HL iter " + str(iteration)
+                  + " req=[" + _ts_str(cursor) + " ... " + _ts_str(req_end) + "]"
+                  + " got " + str(len(data)) + " bars,"
+                  + " last=" + _ts_str(last_ts))
+
+        new_cursor = last_ts + tf_ms
+        if new_cursor <= cursor:
+            new_cursor = req_end
+        cursor = new_cursor
+        time.sleep(0.1)
+
+    print("    [done] HL direct: " + str(len(all_bars)) + " bars total")
+
+    if not all_bars:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_bars, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df = df.drop_duplicates("ts").set_index("ts").sort_index()
+    df_clipped = df[(df.index >= pd.Timestamp(start_ms, unit="ms", tz="UTC"))
+                    & (df.index <= pd.Timestamp(end_ms, unit="ms", tz="UTC"))]
+    print("    [done] HL direct after dedup+clip: " + str(len(df_clipped)) + " bars,"
+          + " range=[" + str(df_clipped.index.min()) + " ... " + str(df_clipped.index.max()) + "]")
+    return df_clipped
 
 
 def fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str,
                           since_ms: int, end_ms: int,
                           max_errors: int = 5) -> pd.DataFrame:
-    """Fetch OHLCV in chunks, with detailed per-call timestamp logging."""
+    """Fetch OHLCV in chunks. For HL: uses direct REST API. Other: ccxt."""
     print("  [data.py " + _DATA_PY_VERSION + "] fetch_ohlcv_paginated: "
           + symbol + " " + timeframe
-          + " requested from=" + _ts_str(since_ms) + " to=" + _ts_str(end_ms))
+          + " from=" + _ts_str(since_ms) + " to=" + _ts_str(end_ms))
 
+    if exchange.id == "hyperliquid":
+        return _hl_fetch_ohlcv_direct(symbol, timeframe, since_ms, end_ms)
+
+    # ccxt path for binance/bybit/okx
     all_bars = []
     errors = 0
-    is_hl = exchange.id == "hyperliquid"
-    tf_ms = TIMEFRAME_MS.get(timeframe, 60 * 60 * 1000)
-
-    chunk_limit = 5000 if is_hl else 1000
-    skip_window_ms = 30 * 24 * 60 * 60 * 1000
-    consecutive_empty = 0
-    max_consecutive_empty = 6
-
     cursor_ms = since_ms
-    iteration = 0
     while cursor_ms < end_ms:
-        iteration += 1
         try:
-            bars = exchange.fetch_ohlcv(symbol, timeframe, since=cursor_ms, limit=chunk_limit)
+            bars = exchange.fetch_ohlcv(symbol, timeframe, since=cursor_ms, limit=1000)
             errors = 0
-
-            if bars and len(bars) > 0:
-                consecutive_empty = 0
-                # DIAGNOSTIC: log first and last bar timestamp returned
-                first_ts = bars[0][0]
-                last_ts = bars[-1][0]
-                print("    iter " + str(iteration)
-                      + " cursor_req=" + _ts_str(cursor_ms)
-                      + " got " + str(len(bars)) + " bars"
-                      + " range=[" + _ts_str(first_ts) + " ... " + _ts_str(last_ts) + "]")
-
-                # If the API ignored our `since` and returned bars from far in the future
-                # (e.g. when since is before listing), we must not loop forever.
-                if first_ts > end_ms:
-                    print("    -> all returned bars are AFTER end_ms; stopping")
-                    break
-
-                all_bars.extend(bars)
-                new_cursor = last_ts + tf_ms
-                if new_cursor <= cursor_ms:
-                    new_cursor = cursor_ms + tf_ms * chunk_limit
-                cursor_ms = new_cursor
-            else:
-                consecutive_empty += 1
-                print("    iter " + str(iteration) + " cursor_req=" + _ts_str(cursor_ms)
-                      + " EMPTY (consecutive=" + str(consecutive_empty) + ")")
-                if not is_hl:
-                    break
-                if consecutive_empty >= max_consecutive_empty:
-                    break
-                cursor_ms += skip_window_ms
-
+            if not bars:
+                break
+            all_bars.extend(bars)
+            cursor_ms = bars[-1][0] + 1
             time.sleep(exchange.rateLimit / 1000)
         except Exception as e:
             errors += 1
@@ -128,30 +199,21 @@ def fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str,
             if errors >= max_errors:
                 raise RuntimeError(
                     "Aborted ohlcv fetch after " + str(max_errors) +
-                    " consecutive errors. Last error: " + str(e)
+                    " errors. Last: " + str(e)
                 )
             time.sleep(2)
-
-    print("    [done] total bars fetched (raw): " + str(len(all_bars)))
-
     if not all_bars:
         return pd.DataFrame()
     df = pd.DataFrame(all_bars, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df = df.drop_duplicates("ts").set_index("ts").sort_index()
-
-    print("    [done] after dedup: " + str(len(df)) + " bars,"
-          + " range=[" + str(df.index.min()) + " ... " + str(df.index.max()) + "]")
-
-    df_clipped = df[df.index <= pd.Timestamp(end_ms, unit="ms", tz="UTC")]
-    print("    [done] after clip <= end_ms: " + str(len(df_clipped)) + " bars")
-
-    return df_clipped
+    return df[df.index <= pd.Timestamp(end_ms, unit="ms", tz="UTC")]
 
 
 def fetch_funding_paginated(exchange, symbol: str,
                             since_ms: int, end_ms: int,
                             max_errors: int = 5) -> pd.DataFrame:
+    """Fetch funding rate history. ccxt works fine for HL funding so we keep it."""
     print("  [data.py " + _DATA_PY_VERSION + "] fetch_funding_paginated: " + symbol)
 
     all_rates = []
@@ -164,26 +226,16 @@ def fetch_funding_paginated(exchange, symbol: str,
     max_consecutive_empty = 6
 
     cursor_ms = since_ms
-    iteration = 0
     while cursor_ms < end_ms:
-        iteration += 1
         try:
             rates = exchange.fetch_funding_rate_history(symbol, since=cursor_ms, limit=chunk_limit)
             errors = 0
 
             if rates and len(rates) > 0:
                 consecutive_empty = 0
-                first_ts = rates[0]["timestamp"]
                 last_ts = rates[-1]["timestamp"]
-                if iteration <= 3 or iteration % 10 == 0:
-                    print("    funding iter " + str(iteration)
-                          + " cursor_req=" + _ts_str(cursor_ms)
-                          + " got " + str(len(rates)) + " rates"
-                          + " range=[" + _ts_str(first_ts) + " ... " + _ts_str(last_ts) + "]")
-
-                if first_ts > end_ms:
+                if rates[0]["timestamp"] > end_ms:
                     break
-
                 all_rates.extend(rates)
                 new_cursor = last_ts + funding_interval_ms
                 if new_cursor <= cursor_ms:
@@ -204,11 +256,11 @@ def fetch_funding_paginated(exchange, symbol: str,
             if errors >= max_errors:
                 raise RuntimeError(
                     "Aborted funding fetch after " + str(max_errors) +
-                    " consecutive errors. Last error: " + str(e)
+                    " errors. Last: " + str(e)
                 )
             time.sleep(2)
 
-    print("    [done] total funding rates fetched: " + str(len(all_rates)))
+    print("    [done] funding: " + str(len(all_rates)) + " rates")
 
     if not all_rates:
         return pd.DataFrame()
@@ -217,7 +269,4 @@ def fetch_funding_paginated(exchange, symbol: str,
          "funding_rate": r["fundingRate"]}
         for r in all_rates
     ])
-    df = df.drop_duplicates("ts").set_index("ts").sort_index()
-    print("    [done] funding after dedup: " + str(len(df))
-          + " range=[" + str(df.index.min()) + " ... " + str(df.index.max()) + "]")
-    return df
+    return df.drop_duplicates("ts").set_index("ts").sort_index()
