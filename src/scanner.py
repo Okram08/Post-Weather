@@ -1,238 +1,322 @@
-"""Scan runner - executes every 4h via GitHub Actions cron.
+"""Live scanner - runs on cron (every 4h) via GitHub Actions.
 
-Workflow:
-  1. Load config + bankroll state
-  2. For each pair: fetch recent 1h ohlcv, compute 4h indicators
-  3. Detect Setup A signals on the latest closed 4h bar
-  4. Apply bankroll gates (halted, max positions, daily loss, etc.)
-  5. Emit accepted signals to Telegram + log to gist (idempotent via signal_id)
-  6. ALWAYS send a heartbeat message to Telegram at end of scan
-     (so user knows the bot is alive even when no setup is found)
+Flow:
+  1. Load config + Gist state (bankroll + idempotency set).
+  2. If halted -> notify and exit (with heartbeat).
+  3. For each pair:
+       a. Fetch last ~300 bars (1h) + current funding.
+       b. Resample to 4h, compute indicators.
+       c. Use the LAST FULLY CLOSED 4h bar as input to setup detection.
+       d. Detect setup A v2 (long/short).
+       e. If signal:
+            - Skip if already emitted (idempotency).
+            - Compute sizing through all bankroll gates.
+            - Push Telegram (signal or rejected).
+            - Append to audit log.
+       f. Always record pair status for the heartbeat.
+  4. Persist state to Gist.
+  5. Send a heartbeat Telegram message with full scan summary.
 """
-import os
 import sys
+import traceback
 from datetime import datetime, timezone
 
 import pandas as pd
 
 from src.config import load_config
-from src.data import make_exchange, fetch_ohlcv_recent, fetch_current_funding
+from src.data import (
+    make_exchange, fetch_ohlcv_recent, fetch_current_funding,
+)
 from src.indicators import resample_to_4h, compute_indicators
-from src.setups import detect_setup_a, build_signal
-from src.bankroll import check_gates, size_position
-from src.state import load_state, save_state, was_signal_emitted, mark_signal_emitted
-from src.telegram_bot import send_telegram
+from src.setups import detect_setup_a
+from src.bankroll import compute_size
+from src.state import GistState, load_bankroll, save_bankroll
+from src.telegram_bot import (
+    send_message, format_signal, format_rejected,
+    format_halt, format_error,
+)
 
 
-def _fmt_pct(x):
-    return "{:+.2%}".format(x) if x is not None else "n/a"
+def _last_closed_4h_bar(ohlc_4h: pd.DataFrame):
+    """Return the last bar that has fully closed (now > bar_start + 4h)."""
+    now = pd.Timestamp.now(tz="UTC")
+    closed = ohlc_4h[ohlc_4h.index + pd.Timedelta(hours=4) <= now]
+    if closed.empty:
+        return None
+    return closed.iloc[-1]
 
 
 def _fmt_usd(x):
-    return "${:.2f}".format(x) if x is not None else "n/a"
-
-
-def main():
-    print("[scanner] start " + datetime.now(timezone.utc).isoformat())
-
-    cfg = load_config()
-    p = dict(cfg.strategy.setup_a)
-    p.setdefault("target_mode", "fixed_pct")
-
-    pairs = cfg.strategy.pairs
-    fees = {"maker_bps": cfg.frictions.maker_fee_bps,
-            "taker_bps": cfg.frictions.taker_fee_bps}
-    sizing = {"initial_capital": cfg.bankroll.initial_capital_usd,
-              "risk_per_trade": cfg.bankroll.risk_per_trade_pct,
-              "max_leverage": cfg.bankroll.max_leverage}
-
-    state = load_state()
-    bankroll = state.get("bankroll", {})
-    equity = bankroll.get("equity_usd", cfg.bankroll.initial_capital_usd)
-    peak = bankroll.get("peak_equity_usd", equity)
-    halted = bankroll.get("halted", False)
-    halt_reason = bankroll.get("halt_reason", "")
-    open_positions = bankroll.get("open_positions", [])
-
-    exchange = make_exchange(cfg.frictions.exchange)
-
-    emitted = []
-    rejected = []
-    inspected = []  # for the heartbeat: state of each pair this scan
-
-    for pair in pairs:
-        print("[scanner] " + pair + " ...")
-        try:
-            ohlc_1h = fetch_ohlcv_recent(exchange, pair, "1h", n_bars=300)
-            if ohlc_1h.empty or len(ohlc_1h) < 48:
-                print("[" + pair + "] not enough data, skip")
-                inspected.append({
-                    "pair": pair, "status": "no-data", "detail": "<48 bars"
-                })
-                continue
-
-            ohlc_4h = compute_indicators(resample_to_4h(ohlc_1h))
-            if ohlc_4h.empty or len(ohlc_4h) < 2:
-                inspected.append({
-                    "pair": pair, "status": "no-data", "detail": "<2 4h bars"
-                })
-                continue
-
-            # Attach current funding rate to the latest 4h bar
-            current_funding = fetch_current_funding(exchange, pair)
-            ohlc_4h["funding_rate"] = current_funding
-
-            # Use the LAST CLOSED 4h bar (penultimate, since the last is in-progress)
-            last_closed = ohlc_4h.iloc[-2]
-
-            d = detect_setup_a(last_closed, p)
-            if d is None:
-                # Capture diagnostic for heartbeat: WHY no setup ?
-                reasons = []
-                if pd.isna(last_closed["adx"]):
-                    reasons.append("adx=nan")
-                elif last_closed["adx"] >= p["adx_max"]:
-                    reasons.append("adx={:.1f}>={}".format(
-                        last_closed["adx"], p["adx_max"]))
-                ext = last_closed.get("extension_atr", float("nan"))
-                rsi = last_closed.get("rsi", float("nan"))
-                fund = last_closed.get("funding_rate", 0.0)
-                reasons.append("ext={:.2f}".format(ext))
-                reasons.append("rsi={:.1f}".format(rsi))
-                reasons.append("fund={:.6f}".format(fund))
-
-                inspected.append({
-                    "pair": pair, "status": "no-setup",
-                    "detail": ", ".join(reasons),
-                })
-                print("[" + pair + "] no setup (" + ", ".join(reasons) + ")")
-                continue
-
-            # We have a setup
-            signal = build_signal(pair, d, last_closed, p)
-
-            inspected.append({
-                "pair": pair, "status": "setup-" + d,
-                "detail": "limit={:.4f}, stop={:.4f}, target={:.4f}".format(
-                    signal["limit"], signal["stop"], signal["target"]
-                ),
-            })
-
-            # Idempotency check
-            if was_signal_emitted(state, signal["signal_id"]):
-                print("[" + pair + "] signal already emitted: " + signal["signal_id"])
-                rejected.append({**signal, "reject_reason": "duplicate"})
-                continue
-
-            # Bankroll gates
-            gate = check_gates(
-                halted=halted, halt_reason=halt_reason,
-                open_positions=open_positions,
-                max_concurrent=cfg.bankroll.max_concurrent_positions,
-                equity_usd=equity, peak_equity_usd=peak,
-                max_drawdown_pct=cfg.bankroll.max_drawdown_pct,
-                daily_pnl_usd=bankroll.get("daily_pnl_usd", 0.0),
-                daily_loss_limit_pct=cfg.bankroll.daily_loss_limit_pct,
-            )
-            if not gate["allowed"]:
-                print("[" + pair + "] gate REJECT: " + gate["reason"])
-                rejected.append({**signal, "reject_reason": gate["reason"]})
-                continue
-
-            # Sizing
-            notional = size_position(
-                equity_usd=equity,
-                risk_per_trade_pct=cfg.bankroll.risk_per_trade_pct,
-                limit_price=signal["limit"], stop_price=signal["stop"],
-                max_leverage=cfg.bankroll.max_leverage,
-            )
-            signal["notional_usd"] = notional
-
-            # Emit
-            msg = format_signal_message(signal, equity)
-            send_telegram(msg)
-            mark_signal_emitted(state, signal["signal_id"])
-            emitted.append(signal)
-            print("[" + pair + "] EMITTED " + signal["signal_id"])
-
-        except Exception as e:
-            print("[" + pair + "] ERROR: " + str(e))
-            inspected.append({"pair": pair, "status": "error", "detail": str(e)})
-
-    save_state(state)
-
-    # Heartbeat: always send a status message at end of scan
-    heartbeat = format_heartbeat(
-        equity=equity, peak=peak, halted=halted, halt_reason=halt_reason,
-        open_positions=open_positions, inspected=inspected,
-        emitted_count=len(emitted), rejected_count=len(rejected),
-    )
     try:
-        send_telegram(heartbeat)
-    except Exception as e:
-        print("[scanner] heartbeat send failed: " + str(e))
-
-    print("Done. Emitted: " + str(len(emitted)) + ", Rejected: " + str(len(rejected)))
+        return "${:.2f}".format(float(x))
+    except (TypeError, ValueError):
+        return "n/a"
 
 
-def format_signal_message(s: dict, equity: float) -> str:
-    arrow = "[LONG]" if s["direction"] == "long" else "[SHORT]"
-    lines = [
-        "*SETUP A signal* " + arrow,
-        "*Pair:* `" + s["pair"] + "`",
-        "*Direction:* " + s["direction"].upper(),
-        "*Limit:* `{:.4f}`".format(s["limit"]),
-        "*Stop:* `{:.4f}`".format(s["stop"]),
-        "*Target:* `{:.4f}`".format(s["target"]),
-        "*Notional:* " + _fmt_usd(s.get("notional_usd")),
-        "*Bankroll:* " + _fmt_usd(equity),
-        "*Signal ID:* `" + s["signal_id"] + "`",
-        "",
-        "_Limit valid 8h, position max 48h_",
-    ]
-    return "\n".join(lines)
+def _fmt_pct(x):
+    try:
+        return "{:+.2%}".format(float(x))
+    except (TypeError, ValueError):
+        return "n/a"
 
 
-def format_heartbeat(equity, peak, halted, halt_reason, open_positions,
-                      inspected, emitted_count, rejected_count) -> str:
+def _format_heartbeat(bankroll, inspected, emitted_count, rejected_count) -> str:
+    """Build the always-sent end-of-scan summary message."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    dd_pct = ((equity - peak) / peak) if peak > 0 else 0.0
+
+    # Try to extract bankroll fields - support both dict and object
+    def get(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    equity = get(bankroll, "equity_usd", None)
+    peak = get(bankroll, "peak_equity_usd", None)
+    halted = get(bankroll, "halted", False)
+    halt_reason = get(bankroll, "halt_reason", "")
+    open_positions = get(bankroll, "open_positions", []) or []
+
+    dd_pct = None
+    if equity is not None and peak and peak > 0:
+        dd_pct = (float(equity) - float(peak)) / float(peak)
 
     lines = [
         "*Scan done* `" + now + "`",
         "",
         "*Bankroll:* " + _fmt_usd(equity)
             + " (peak " + _fmt_usd(peak) + ", DD " + _fmt_pct(dd_pct) + ")",
-        "*Halted:* " + ("YES - " + halt_reason if halted else "no"),
+        "*Halted:* " + ("YES - " + str(halt_reason) if halted else "no"),
         "*Open positions:* " + str(len(open_positions)),
         "*Emitted:* " + str(emitted_count) + " | *Rejected:* " + str(rejected_count),
         "",
         "*Pairs:*",
     ]
     for d in inspected:
-        emoji = {
+        tag = {
             "setup-long": "[LONG]",
             "setup-short": "[SHORT]",
             "no-setup": "[--]",
             "no-data": "[??]",
+            "halted": "[HALT]",
             "error": "[!!]",
         }.get(d["status"], "[--]")
-        lines.append("  " + emoji + " `" + d["pair"] + "` " + d["detail"])
+        lines.append("  " + tag + " `" + d["pair"] + "` " + d.get("detail", ""))
 
     return "\n".join(lines)
 
 
-if __name__ == "__main__":
+def _send_heartbeat(cfg, bankroll, inspected, emitted_count, rejected_count):
+    if not cfg.telegram.enabled:
+        return
     try:
-        main()
+        msg = _format_heartbeat(bankroll, inspected, emitted_count, rejected_count)
+        send_message(cfg.telegram.bot_token, cfg.telegram.chat_id, msg)
     except Exception as e:
-        # Final safety net: even on crash, send something to Telegram
-        err_msg = "*Scanner CRASHED* `{}`\n\n```\n{}\n```".format(
-            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-            str(e)[:500]
-        )
+        print("[heartbeat] failed: " + str(e))
+
+
+def run() -> int:
+    inspected = []
+    n_emitted = 0
+    n_rejected = 0
+
+    try:
+        cfg = load_config()
+    except Exception as e:
+        print("[fatal] config load: " + str(e))
+        return 1
+
+    if not cfg.gist.pat or not cfg.gist.state_gist_id:
+        print("[fatal] GIST_PAT or GIST_STATE_ID missing")
+        return 1
+
+    gist = GistState(cfg.gist.pat, cfg.gist.state_gist_id)
+
+    # Bankroll
+    try:
+        bankroll = load_bankroll(gist, {
+            "initial_capital_usd": cfg.bankroll.initial_capital_usd
+        })
+    except Exception as e:
+        print("[fatal] cannot load bankroll: " + str(e))
+        if cfg.telegram.enabled:
+            send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
+                         "Cannot load bankroll: `" + str(e) + "`")
+        return 1
+
+    # Halted: still send a heartbeat so user knows
+    if getattr(bankroll, "halted", False):
+        if cfg.telegram.enabled:
+            send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
+                         format_halt(bankroll.halt_reason))
+        for pair in cfg.strategy.pairs:
+            inspected.append({
+                "pair": pair, "status": "halted",
+                "detail": "scanner halted",
+            })
+        _send_heartbeat(cfg, bankroll, inspected, 0, 0)
+        print("[halt] " + str(bankroll.halt_reason))
+        return 0
+
+    # Idempotency set
+    emitted = set(gist.read("emitted_signals.json").get("ids", []))
+
+    exchange = make_exchange(cfg.frictions.exchange)
+
+    bankroll_params = {
+        "risk_per_trade_pct": cfg.bankroll.risk_per_trade_pct,
+        "max_concurrent_positions": cfg.bankroll.max_concurrent_positions,
+        "max_leverage": cfg.bankroll.max_leverage,
+        "daily_loss_limit_pct": cfg.bankroll.daily_loss_limit_pct,
+        "max_drawdown_pct": cfg.bankroll.max_drawdown_pct,
+        "sizing_model": cfg.bankroll.sizing_model,
+        "kelly_fraction": cfg.bankroll.kelly_fraction,
+    }
+
+    for pair in cfg.strategy.pairs:
         try:
-            send_telegram(err_msg)
-        except Exception:
-            pass
-        raise
+            ohlc_1h = fetch_ohlcv_recent(exchange, pair, "1h", n_bars=300)
+            if ohlc_1h.empty or len(ohlc_1h) < 100:
+                print("[" + pair + "] insufficient data")
+                inspected.append({
+                    "pair": pair, "status": "no-data",
+                    "detail": "<100 1h bars",
+                })
+                continue
+
+            ohlc_4h = compute_indicators(resample_to_4h(ohlc_1h))
+            if len(ohlc_4h) < 30:
+                print("[" + pair + "] not enough 4h history yet")
+                inspected.append({
+                    "pair": pair, "status": "no-data",
+                    "detail": "<30 4h bars",
+                })
+                continue
+
+            funding = fetch_current_funding(exchange, pair)
+            ohlc_4h = ohlc_4h.copy()
+            ohlc_4h["funding_rate"] = funding
+
+            last_bar = _last_closed_4h_bar(ohlc_4h)
+            if last_bar is None:
+                print("[" + pair + "] no closed bar yet")
+                inspected.append({
+                    "pair": pair, "status": "no-data",
+                    "detail": "no closed 4h bar",
+                })
+                continue
+
+            current_price = float(ohlc_1h["close"].iloc[-1])
+
+            signal = detect_setup_a(last_bar, pair, current_price,
+                                    cfg.strategy.setup_a)
+
+            # Build a diagnostic detail string for the heartbeat regardless
+            ext = float(last_bar.get("extension_atr", float("nan")))
+            rsi = float(last_bar.get("rsi", float("nan")))
+            adx = float(last_bar.get("adx", float("nan")))
+            fund = float(last_bar.get("funding_rate", 0.0))
+            ind_detail = "ext={:.2f} rsi={:.1f} adx={:.1f} fund={:.6f}".format(
+                ext, rsi, adx, fund)
+
+            if signal is None:
+                print("[" + pair + "] no setup")
+                inspected.append({
+                    "pair": pair, "status": "no-setup",
+                    "detail": ind_detail,
+                })
+                continue
+
+            # We have a signal - get its direction for the heartbeat tag
+            direction = getattr(signal, "direction", "long")
+            sig_id = getattr(signal, "signal_id", "")
+
+            if sig_id in emitted:
+                print("[" + pair + "] duplicate " + sig_id + ", skip")
+                inspected.append({
+                    "pair": pair, "status": "setup-" + direction,
+                    "detail": "duplicate " + sig_id,
+                })
+                continue
+
+            sizing = compute_size(bankroll, signal, bankroll_params)
+            if sizing.accept:
+                msg = format_signal(signal, sizing, bankroll)
+                if cfg.telegram.enabled:
+                    send_message(cfg.telegram.bot_token, cfg.telegram.chat_id, msg)
+                print("[" + pair + "] EMITTED " + sig_id + " (" + direction + ")")
+                n_emitted += 1
+                emitted.add(sig_id)
+                inspected.append({
+                    "pair": pair, "status": "setup-" + direction,
+                    "detail": "EMITTED " + sig_id,
+                })
+                gist.append_log("signals_log.json", {
+                    "id": sig_id,
+                    "pair": pair,
+                    "direction": direction,
+                    "limit": getattr(signal, "limit_price", None),
+                    "stop": getattr(signal, "stop_price", None),
+                    "target": getattr(signal, "target_price", None),
+                    "notional_usd": sizing.notional_usd,
+                    "leverage": sizing.leverage_implied,
+                    "risk_usd": sizing.risk_amount_usd,
+                    "current_price": getattr(signal, "current_price", None),
+                    "rsi": getattr(signal, "rsi", None),
+                    "adx": getattr(signal, "adx", None),
+                    "funding_rate": getattr(signal, "funding_rate", None),
+                    "extension_atr": getattr(signal, "extension_atr", None),
+                    "status": "emitted",
+                })
+            else:
+                msg = format_rejected(signal, sizing)
+                if cfg.telegram.enabled:
+                    send_message(cfg.telegram.bot_token, cfg.telegram.chat_id, msg)
+                print("[" + pair + "] REJECTED " + sig_id + ": " + str(sizing.reason))
+                n_rejected += 1
+                emitted.add(sig_id)
+                inspected.append({
+                    "pair": pair, "status": "setup-" + direction,
+                    "detail": "REJECTED: " + str(sizing.reason),
+                })
+                gist.append_log("signals_log.json", {
+                    "id": sig_id,
+                    "pair": pair,
+                    "direction": direction,
+                    "status": "rejected",
+                    "reason": sizing.reason,
+                })
+
+        except Exception as e:
+            err = type(e).__name__ + ": " + str(e)
+            print("[" + pair + "] error: " + err)
+            traceback.print_exc()
+            inspected.append({
+                "pair": pair, "status": "error", "detail": err[:80],
+            })
+            if cfg.telegram.enabled:
+                send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
+                             format_error(pair, err))
+
+    # Persist
+    try:
+        gist.write("emitted_signals.json", {"ids": list(emitted)[-500:]})
+        save_bankroll(gist, bankroll)
+    except Exception as e:
+        print("[fatal] cannot persist state: " + str(e))
+        if cfg.telegram.enabled:
+            send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
+                         "Cannot persist state: `" + str(e) + "`")
+        # Still send heartbeat before exiting
+        _send_heartbeat(cfg, bankroll, inspected, n_emitted, n_rejected)
+        return 1
+
+    # Always send heartbeat at the end
+    _send_heartbeat(cfg, bankroll, inspected, n_emitted, n_rejected)
+
+    print("\nDone. Emitted: " + str(n_emitted) + ", Rejected: " + str(n_rejected))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())
