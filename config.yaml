@@ -19,11 +19,12 @@ strategy:
 
     # Risk management
     stop_atr: 1.5
-    target_pct: 0.01              # +1% target
+    target_mode: vwap             # 'vwap' (mean reversion target) or 'fixed_pct'
+    target_pct: 0.01              # used only if target_mode = 'fixed_pct'
 
     # Time controls
     limit_validity_hours: 8       # cancel if not filled in 8h
-    position_max_hours: 12        # close position at market after 12h
+    position_max_hours: 48        # close at market after 48h (was 12, too tight for VWAP target)
 
 bankroll:
   initial_capital_usd: 10000.0
@@ -41,9 +42,6 @@ bankroll:
 
 frictions:
   exchange: okx                   # binance | bybit | okx
-                                  # Binance + Bybit bloqués sur IPs GitHub Actions (US)
-                                  # OKX = dernière chance sur runner GitHub-hosted
-                                  # Si OKX échoue aussi → self-hosted runner obligatoire
   maker_fee_bps: 2.0              # OKX USDT perp Lv1 maker
   taker_fee_bps: 5.0              # OKX USDT perp Lv1 taker
 
