@@ -312,12 +312,24 @@ def main():
     parser.add_argument("--start", default="2023-01-01")
     parser.add_argument("--end", default="2025-12-31")
     parser.add_argument("--pairs", default=None)
-    parser.add_argument("--setup_atr", type=float, default=None)
-    parser.add_argument("--limit_atr", type=float, default=None)
-    parser.add_argument("--stop_atr", type=float, default=None)
-    parser.add_argument("--target_pct", type=float, default=None)
+    parser.add_argument("--setup_atr", type=float, default=None,
+                        help="Override extension threshold (default 1.5)")
+    parser.add_argument("--limit_atr", type=float, default=None,
+                        help="Override limit placement (ATR units past VWAP)")
+    parser.add_argument("--stop_atr", type=float, default=None,
+                        help="Override stop distance from limit (ATR units)")
+    parser.add_argument("--target_pct", type=float, default=None,
+                        help="Override fixed-pct target (only if target_mode=fixed_pct)")
     parser.add_argument("--target_mode", default=None,
                         help="Override target_mode: vwap | fixed_pct")
+    parser.add_argument("--rsi_threshold", type=float, default=None,
+                        help="Override RSI oversold threshold (default 30)")
+    parser.add_argument("--funding_threshold", type=float, default=None,
+                        help="Override funding rate threshold (default -0.0002)")
+    parser.add_argument("--adx_max", type=float, default=None,
+                        help="Override ADX max threshold (default 25)")
+    parser.add_argument("--position_max_hours", type=float, default=None,
+                        help="Override position max hold time")
     parser.add_argument("--force_no_funding", action="store_true",
                         help="Force run without funding filter")
     parser.add_argument("--cache_dir", default="cache")
@@ -331,7 +343,11 @@ def main():
     if args.stop_atr is not None: p["stop_atr"] = args.stop_atr
     if args.target_pct is not None: p["target_pct"] = args.target_pct
     if args.target_mode is not None: p["target_mode"] = args.target_mode
-    p.setdefault("target_mode", "fixed_pct")  # backward compat
+    if args.rsi_threshold is not None: p["rsi_threshold"] = args.rsi_threshold
+    if args.funding_threshold is not None: p["funding_threshold"] = args.funding_threshold
+    if args.adx_max is not None: p["adx_max"] = args.adx_max
+    if args.position_max_hours is not None: p["position_max_hours"] = args.position_max_hours
+    p.setdefault("target_mode", "fixed_pct")
 
     pairs = (args.pairs.split(",") if args.pairs else cfg.strategy.pairs)
     pairs = [s.strip() for s in pairs]
@@ -449,6 +465,10 @@ def main():
         summary_lines.append(f"  funding rates   : {d.get('funding_rates', 0)}")
         summary_lines.append(f"  funding density : {d.get('funding_density', 0.0):.1%}")
         summary_lines.append(f"  valid 4h bars   : {d.get('valid_4h_bars', 0)}")
+        summary_lines.append(f"  n_funding_neg   : {d.get('n_funding_neg', 0)}")
+        summary_lines.append(f"  n_funding_pos   : {d.get('n_funding_pos', 0)}")
+        if "funding_min" in d:
+            summary_lines.append(f"  funding range   : [{d['funding_min']:.6f}, {d['funding_max']:.6f}]")
         summary_lines.append(f"  signals         : {d.get('signals', 0)}")
         summary_lines.append(f"  filled          : {d.get('filled', 0)}")
         summary_lines.append("")
@@ -456,20 +476,4 @@ def main():
     summary_lines.append("")
 
     if metrics.get("total_signals", 0) == 0:
-        summary_lines.append("⚠️  Aucun signal détecté.")
-    else:
-        for k, v in metrics.items():
-            if isinstance(v, float):
-                summary_lines.append(f"{k:30s}: {v:.4f}")
-            else:
-                summary_lines.append(f"{k:30s}: {v}")
-
-    text = "\n".join(summary_lines)
-    print("\n" + text)
-    (out / "summary.txt").write_text(text)
-    _plot_equity(portfolio, sizing["initial_capital"], out / "equity_curve.png")
-    print(f"\n→ results in {out}/")
-
-
-if __name__ == "__main__":
-    main()
+        summary_lines.append("⚠️  Aucun sig
