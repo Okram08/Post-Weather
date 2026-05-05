@@ -1,20 +1,23 @@
 # crypto-trading-bot configuration
-# Edit and git push — the next scan picks up the new values.
+# Edit and git push - the next scan picks up the new values.
 
 strategy:
   pairs:
-    - "BTC/USDT:USDT"
-    - "ETH/USDT:USDT"
-    - "SOL/USDT:USDT"
+    - "BTC/USDC:USDC"
+    - "ETH/USDC:USDC"
+    - "SOL/USDC:USDC"
 
   setup_a:
     # Detection thresholds (on 4h bar close)
     setup_atr_extension: 1.5      # |close - vwap_24h| / atr > 1.5
     rsi_threshold: 30.0           # RSI_4h < 30 long, > 70 short
     adx_max: 25.0                 # ADX < 25 = range regime (anti-trend filter)
-    funding_threshold: -0.0002    # 8h funding < -0.02% for long (symmetric for short)
 
-    # Limit order placement (deeper than trigger → better fills)
+    # Funding threshold: Hyperliquid pays funding HOURLY (not 8h like Binance/OKX).
+    # -0.000025/h = -22%/year annualized (= old -0.0002/8h on Binance)
+    funding_threshold: -0.000025
+
+    # Limit order placement (deeper than trigger -> better fills)
     limit_extension_atr: 2.5
 
     # Risk management
@@ -32,18 +35,18 @@ bankroll:
   max_concurrent_positions: 3
   max_leverage: 3.0               # implied leverage cap (safety)
 
-  # Circuit breakers — automatic halt
-  daily_loss_limit_pct: 0.03      # -3% in 24h → halt for 24h
-  max_drawdown_pct: 0.15          # -15% from peak → halt until manual reset
+  # Circuit breakers - automatic halt
+  daily_loss_limit_pct: 0.03      # -3% in 24h -> halt for 24h
+  max_drawdown_pct: 0.15          # -15% from peak -> halt until manual reset
 
   # Sizing model
   sizing_model: fixed             # 'fixed' (use risk_per_trade_pct) or 'kelly_fraction'
   kelly_fraction: 0.25            # only used if sizing_model = 'kelly_fraction'
 
 frictions:
-  exchange: okx                   # binance | bybit | okx
-  maker_fee_bps: 2.0              # OKX USDT perp Lv1 maker
-  taker_fee_bps: 5.0              # OKX USDT perp Lv1 taker
+  exchange: hyperliquid           # binance | bybit | okx | hyperliquid
+  maker_fee_bps: 1.0              # Hyperliquid standard maker
+  taker_fee_bps: 3.5              # Hyperliquid standard taker
 
 telegram:
   enabled: true
