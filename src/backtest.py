@@ -2,7 +2,7 @@
 
 Supports two target modes (configured in config.yaml under setup_a.target_mode):
   - 'vwap'      : target = VWAP (proper mean-reversion target). Recommended.
-  - 'fixed_pct' : target = limit ± target_pct (simple fixed % target).
+  - 'fixed_pct' : target = limit +/- target_pct (simple fixed % target).
 
 Auto-detects if funding data is dense enough; if not, runs with the funding
 condition disabled and logs the fallback explicitly.
@@ -301,7 +301,7 @@ def _plot_equity(df: pd.DataFrame, initial_capital: float, out_path: Path):
     plt.figure(figsize=(12, 6))
     plt.plot(filled["exit_time"], filled["equity"])
     plt.axhline(initial_capital, color="grey", linestyle=":", linewidth=0.8)
-    plt.title("Setup A v2 — Backtest equity curve")
+    plt.title("Setup A v2 - Backtest equity curve")
     plt.xlabel("Date"); plt.ylabel("Equity (USD)")
     plt.grid(True, alpha=0.3); plt.tight_layout()
     plt.savefig(out_path, dpi=100); plt.close()
@@ -361,11 +361,13 @@ def main():
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     cache = Path(args.cache_dir); cache.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nExchange: {cfg.frictions.exchange}")
-    print(f"Pairs:    {pairs}")
-    print(f"Period:   {args.start} → {args.end}")
-    print(f"Target mode: {p['target_mode']}")
-    print(f"Params:   {p}\n")
+    print("")
+    print("Exchange:    " + str(cfg.frictions.exchange))
+    print("Pairs:       " + str(pairs))
+    print("Period:      " + args.start + " -> " + args.end)
+    print("Target mode: " + str(p["target_mode"]))
+    print("Params:      " + str(p))
+    print("")
 
     exchange = make_exchange(cfg.frictions.exchange)
     since_ms = int(pd.Timestamp(args.start, tz="UTC").timestamp() * 1000)
@@ -376,10 +378,10 @@ def main():
     funding_modes = {}
 
     for pair in pairs:
-        print(f"=== {pair} ===")
-        cache_path = cache / f"{pair.replace('/','_').replace(':','_')}_{args.start}_{args.end}.pkl"
+        print("=== " + pair + " ===")
+        cache_path = cache / (pair.replace("/", "_").replace(":", "_") + "_" + args.start + "_" + args.end + ".pkl")
         if cache_path.exists():
-            print(f"  loading cache: {cache_path.name}")
+            print("  loading cache: " + cache_path.name)
             with open(cache_path, "rb") as f:
                 data = pickle.load(f)
         else:
@@ -393,13 +395,13 @@ def main():
 
         n_bars = len(data["ohlc_1h"])
         n_funding = len(data["funding"])
-        print(f"  → bars 1h: {n_bars}, funding rates: {n_funding}")
+        print("  -> bars 1h: " + str(n_bars) + ", funding rates: " + str(n_funding))
 
         diag = {"bars_1h": n_bars, "funding_rates": n_funding,
                 "signals": 0, "filled": 0}
 
         if n_bars == 0:
-            print("  ⚠️  no ohlcv data, skipping")
+            print("  [WARN] no ohlcv data, skipping")
             pair_diag[pair] = diag
             funding_modes[pair] = "skipped"
             continue
@@ -414,29 +416,29 @@ def main():
             mode = "FORCED OFF"
         elif density >= FUNDING_DENSITY_MIN:
             use_funding = True
-            mode = f"ON (density {density:.1%})"
+            mode = "ON (density {:.1%})".format(density)
         else:
             use_funding = False
-            mode = f"AUTO-OFF (density {density:.1%})"
-        print(f"  → funding filter: {mode}")
+            mode = "AUTO-OFF (density {:.1%})".format(density)
+        print("  -> funding filter: " + mode)
         funding_modes[pair] = mode
 
         trades = _backtest_pair(pair, ohlc_4h, data["ohlc_1h"], data["funding"],
                                 p, fees, sizing, use_funding)
         diag["signals"] = len(trades)
         diag["filled"] = sum(1 for t in trades if t.exit_reason != "unfilled")
-        print(f"  → signals: {diag['signals']}, filled: {diag['filled']}")
+        print("  -> signals: " + str(diag["signals"]) + ", filled: " + str(diag["filled"]))
 
         df = _trades_df(trades)
-        df.to_csv(out / f"trades_{pair.replace('/','_').replace(':','_')}.csv", index=False)
+        df.to_csv(out / ("trades_" + pair.replace("/", "_").replace(":", "_") + ".csv"), index=False)
         m = _metrics(df, sizing["initial_capital"])
         if m.get("filled", 0) > 0:
-            print(f"  win_rate={m['win_rate']:.1%}, "
-                  f"PnL ${m['total_pnl_usd']:.0f} ({m['total_return_pct']:.1%}), "
-                  f"Sharpe {m['sharpe_annualized']:.2f}, DD {m['max_drawdown_pct']:.1%}")
+            print("  win_rate={:.1%}, PnL ${:.0f} ({:.1%}), Sharpe {:.2f}, DD {:.1%}".format(
+                m["win_rate"], m["total_pnl_usd"], m["total_return_pct"],
+                m["sharpe_annualized"], m["max_drawdown_pct"]))
         all_trades.extend(trades)
         pair_diag[pair] = diag
-        print()
+        print("")
 
     portfolio = _trades_df(all_trades)
     if not portfolio.empty:
@@ -445,35 +447,30 @@ def main():
     metrics = _metrics(portfolio, sizing["initial_capital"])
 
     summary_lines = ["PORTFOLIO METRICS", "=" * 40,
-                     f"exchange     : {cfg.frictions.exchange}",
-                     f"period       : {args.start} → {args.end}",
-                     f"target mode  : {p['target_mode']}",
-                     f"pairs        : {', '.join(pairs)}",
-                     f"params       : {p}", ""]
+                     "exchange     : " + str(cfg.frictions.exchange),
+                     "period       : " + args.start + " -> " + args.end,
+                     "target mode  : " + str(p["target_mode"]),
+                     "pairs        : " + ", ".join(pairs),
+                     "params       : " + str(p), ""]
 
     summary_lines.append("FUNDING FILTER MODE PER PAIR")
     summary_lines.append("-" * 40)
     for pair, mode in funding_modes.items():
-        summary_lines.append(f"  {pair}: {mode}")
+        summary_lines.append("  " + pair + ": " + mode)
     summary_lines.append("")
 
     summary_lines.append("PER-PAIR DIAGNOSTIC")
     summary_lines.append("-" * 40)
     for pair, d in pair_diag.items():
-        summary_lines.append(f"{pair}")
-        summary_lines.append(f"  bars 1h         : {d.get('bars_1h', 0)}")
-        summary_lines.append(f"  funding rates   : {d.get('funding_rates', 0)}")
-        summary_lines.append(f"  funding density : {d.get('funding_density', 0.0):.1%}")
-        summary_lines.append(f"  valid 4h bars   : {d.get('valid_4h_bars', 0)}")
-        summary_lines.append(f"  n_funding_neg   : {d.get('n_funding_neg', 0)}")
-        summary_lines.append(f"  n_funding_pos   : {d.get('n_funding_pos', 0)}")
+        summary_lines.append(pair)
+        summary_lines.append("  bars 1h         : " + str(d.get("bars_1h", 0)))
+        summary_lines.append("  funding rates   : " + str(d.get("funding_rates", 0)))
+        summary_lines.append("  funding density : {:.1%}".format(d.get("funding_density", 0.0)))
+        summary_lines.append("  valid 4h bars   : " + str(d.get("valid_4h_bars", 0)))
+        summary_lines.append("  n_funding_neg   : " + str(d.get("n_funding_neg", 0)))
+        summary_lines.append("  n_funding_pos   : " + str(d.get("n_funding_pos", 0)))
         if "funding_min" in d:
-            summary_lines.append(f"  funding range   : [{d['funding_min']:.6f}, {d['funding_max']:.6f}]")
-        summary_lines.append(f"  signals         : {d.get('signals', 0)}")
-        summary_lines.append(f"  filled          : {d.get('filled', 0)}")
-        summary_lines.append("")
-    summary_lines.append("-" * 40)
-    summary_lines.append("")
-
-    if metrics.get("total_signals", 0) == 0:
-        summary_lines.append("⚠️  Aucun sig
+            summary_lines.append("  funding range   : [{:.6f}, {:.6f}]".format(
+                d["funding_min"], d["funding_max"]))
+        summary_lines.append("  signals         : " + str(d.get("signals", 0)))
+        summary_
