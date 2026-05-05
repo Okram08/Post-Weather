@@ -97,7 +97,6 @@ def _detect_at(row: pd.Series, p: dict, use_funding: bool) -> Optional[str]:
 
 
 def _compute_levels(direction: str, vwap: float, atr: float, p: dict):
-    """Returns (limit, stop, target) according to target_mode."""
     target_mode = p.get("target_mode", "fixed_pct")
     if direction == "long":
         limit = vwap - p["limit_extension_atr"] * atr
@@ -312,26 +311,16 @@ def main():
     parser.add_argument("--start", default="2023-01-01")
     parser.add_argument("--end", default="2025-12-31")
     parser.add_argument("--pairs", default=None)
-    parser.add_argument("--setup_atr", type=float, default=None,
-                        help="Override extension threshold (default 1.5)")
-    parser.add_argument("--limit_atr", type=float, default=None,
-                        help="Override limit placement (ATR units past VWAP)")
-    parser.add_argument("--stop_atr", type=float, default=None,
-                        help="Override stop distance from limit (ATR units)")
-    parser.add_argument("--target_pct", type=float, default=None,
-                        help="Override fixed-pct target (only if target_mode=fixed_pct)")
-    parser.add_argument("--target_mode", default=None,
-                        help="Override target_mode: vwap | fixed_pct")
-    parser.add_argument("--rsi_threshold", type=float, default=None,
-                        help="Override RSI oversold threshold (default 30)")
-    parser.add_argument("--funding_threshold", type=float, default=None,
-                        help="Override funding rate threshold (default -0.0002)")
-    parser.add_argument("--adx_max", type=float, default=None,
-                        help="Override ADX max threshold (default 25)")
-    parser.add_argument("--position_max_hours", type=float, default=None,
-                        help="Override position max hold time")
-    parser.add_argument("--force_no_funding", action="store_true",
-                        help="Force run without funding filter")
+    parser.add_argument("--setup_atr", type=float, default=None)
+    parser.add_argument("--limit_atr", type=float, default=None)
+    parser.add_argument("--stop_atr", type=float, default=None)
+    parser.add_argument("--target_pct", type=float, default=None)
+    parser.add_argument("--target_mode", default=None)
+    parser.add_argument("--rsi_threshold", type=float, default=None)
+    parser.add_argument("--funding_threshold", type=float, default=None)
+    parser.add_argument("--adx_max", type=float, default=None)
+    parser.add_argument("--position_max_hours", type=float, default=None)
+    parser.add_argument("--force_no_funding", action="store_true")
     parser.add_argument("--cache_dir", default="cache")
     parser.add_argument("--output_dir", default="backtest_results")
     args = parser.parse_args()
