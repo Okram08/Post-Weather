@@ -1,15 +1,13 @@
-"""Exchange OHLCV + funding rate fetcher (live + historical).
+"""Exchange OHLCV + funding rate fetcher.
 
 Supports: binance, bybit, okx, hyperliquid.
-- binance/bybit/okx: USDT-margined perpetual swaps (BTC/USDT:USDT)
-- hyperliquid: USDC-margined perpetual swaps (BTC/USDC:USDC)
-                funding paid hourly (vs 8h elsewhere)
 
-Hyperliquid pagination quirk:
-  - OHLCV: max ~5000 candles per call but the API limits the time WINDOW per call,
-    not the number of candles returned. So we must paginate by absolute time step,
-    not by relying on the last returned candle's timestamp.
-  - Funding: 500 max per call, paginate by since/limit.
+Hyperliquid quirks:
+  - USDC-margined perps (BTC/USDC:USDC, not USDT)
+  - Funding paid hourly (not 8h)
+  - OHLCV: API may return fewer bars than requested limit; advance by last bar
+    timestamp, and jump by chunk_window only when API returns ZERO bars
+    (to skip pre-listing periods)
 """
 import time
 
@@ -17,7 +15,9 @@ import ccxt
 import pandas as pd
 
 
-# Map ccxt timeframe strings to milliseconds
+_DATA_PY_VERSION = "v3-hl-pagination-fix-20260505"
+
+
 TIMEFRAME_MS = {
     "1m": 60 * 1000,
     "5m": 5 * 60 * 1000,
@@ -30,29 +30,17 @@ TIMEFRAME_MS = {
 
 
 def make_exchange(name: str = "bybit"):
+    print("[data.py " + _DATA_PY_VERSION + "] make_exchange: " + name)
     if name == "binance":
-        return ccxt.binance({
-            "options": {"defaultType": "swap"},
-            "enableRateLimit": True,
-        })
+        return ccxt.binance({"options": {"defaultType": "swap"}, "enableRateLimit": True})
     if name == "bybit":
-        return ccxt.bybit({
-            "options": {"defaultType": "swap"},
-            "enableRateLimit": True,
-        })
+        return ccxt.bybit({"options": {"defaultType": "swap"}, "enableRateLimit": True})
     if name == "okx":
-        return ccxt.okx({
-            "options": {"defaultType": "swap"},
-            "enableRateLimit": True,
-        })
+        return ccxt.okx({"options": {"defaultType": "swap"}, "enableRateLimit": True})
     if name == "hyperliquid":
-        return ccxt.hyperliquid({
-            "enableRateLimit": True,
-        })
+        return ccxt.hyperliquid({"enableRateLimit": True})
     raise ValueError("Unsupported exchange: " + name)
 
-
-# ---- Live (last N bars / current funding) ----
 
 def fetch_ohlcv_recent(exchange, symbol: str, timeframe: str, n_bars: int = 300) -> pd.DataFrame:
     bars = exchange.fetch_ohlcv(symbol, timeframe, limit=n_bars)
@@ -77,55 +65,70 @@ def fetch_current_funding(exchange, symbol: str) -> float:
         return 0.0
 
 
-# ---- Historical paginated (for backtests) ----
-
 def fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str,
                           since_ms: int, end_ms: int,
                           max_errors: int = 5) -> pd.DataFrame:
     """Fetch OHLCV in chunks. Aborts after `max_errors` consecutive failures.
 
-    Hyperliquid: paginate by explicit time step (since + chunk_window) because
-    the API caps the time window per call regardless of `limit` parameter.
-    Other exchanges: rely on last returned candle timestamp + 1.
+    Logic:
+      - If API returns bars: advance cursor to (last_bar_ts + 1 timeframe).
+      - If API returns NO bars: jump forward by skip_window (to skip pre-listing).
+      - Stop when cursor passes end_ms or we get 3 empty results in a row past
+        the listing date.
     """
+    print("  [data.py " + _DATA_PY_VERSION + "] fetch_ohlcv_paginated: "
+          + symbol + " " + timeframe
+          + " from=" + str(pd.Timestamp(since_ms, unit='ms', tz='UTC'))
+          + " to=" + str(pd.Timestamp(end_ms, unit='ms', tz='UTC')))
+
     all_bars = []
     errors = 0
     is_hl = exchange.id == "hyperliquid"
+    tf_ms = TIMEFRAME_MS.get(timeframe, 60 * 60 * 1000)
 
-    if is_hl:
-        # HL: use 5000-candle chunks but advance by chunk window in milliseconds
-        chunk_limit = 5000
-        tf_ms = TIMEFRAME_MS.get(timeframe, 60 * 60 * 1000)
-        chunk_window_ms = chunk_limit * tf_ms
-    else:
-        chunk_limit = 1000
-        chunk_window_ms = None  # we use last-bar advance for non-HL
+    # Per-call limit
+    chunk_limit = 5000 if is_hl else 1000
+    # Skip window when no bars returned (used only for HL to skip pre-listing)
+    skip_window_ms = 30 * 24 * 60 * 60 * 1000  # 30 days
+    consecutive_empty = 0
+    max_consecutive_empty = 6  # allow up to 6 months of empty before giving up
 
     cursor_ms = since_ms
+    iteration = 0
     while cursor_ms < end_ms:
+        iteration += 1
         try:
             bars = exchange.fetch_ohlcv(symbol, timeframe, since=cursor_ms, limit=chunk_limit)
             errors = 0
 
-            if is_hl:
-                # Always advance by chunk window, even if the API returned fewer bars
-                # than requested (because the API may be capping the time window).
-                if bars:
-                    all_bars.extend(bars)
-                    last_ts = bars[-1][0]
-                    # Advance to either last_ts + 1ms OR cursor + chunk_window, whichever is later
-                    next_cursor = max(last_ts + tf_ms, cursor_ms + chunk_window_ms)
-                else:
-                    # No bars returned: jump forward by full window to avoid infinite loop
-                    next_cursor = cursor_ms + chunk_window_ms
-                if next_cursor <= cursor_ms:
-                    break
-                cursor_ms = next_cursor
-            else:
-                if not bars:
-                    break
+            if bars and len(bars) > 0:
+                consecutive_empty = 0
                 all_bars.extend(bars)
-                cursor_ms = bars[-1][0] + 1
+                last_ts = bars[-1][0]
+                # Always advance by last_ts + 1 timeframe (never skip valid data)
+                new_cursor = last_ts + tf_ms
+                if new_cursor <= cursor_ms:
+                    # Defensive: if API returned bars before our since, force advance
+                    new_cursor = cursor_ms + tf_ms * chunk_limit
+                cursor_ms = new_cursor
+                if iteration % 5 == 0:
+                    print("    iter " + str(iteration) + ": "
+                          + str(len(all_bars)) + " bars cumul, cursor="
+                          + str(pd.Timestamp(cursor_ms, unit='ms', tz='UTC')))
+            else:
+                # Empty response
+                consecutive_empty += 1
+                if not is_hl:
+                    # For non-HL exchanges, empty = end of data, stop
+                    break
+                # For HL: skip forward to find first available data
+                if consecutive_empty >= max_consecutive_empty:
+                    print("    " + str(consecutive_empty) + " consecutive empty responses, stopping")
+                    break
+                cursor_ms += skip_window_ms
+                print("    empty response (consecutive=" + str(consecutive_empty)
+                      + "), skipping +30d to "
+                      + str(pd.Timestamp(cursor_ms, unit='ms', tz='UTC')))
 
             time.sleep(exchange.rateLimit / 1000)
         except Exception as e:
@@ -138,6 +141,8 @@ def fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str,
                 )
             time.sleep(2)
 
+    print("    [done] total bars fetched: " + str(len(all_bars)))
+
     if not all_bars:
         return pd.DataFrame()
     df = pd.DataFrame(all_bars, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -149,18 +154,18 @@ def fetch_ohlcv_paginated(exchange, symbol: str, timeframe: str,
 def fetch_funding_paginated(exchange, symbol: str,
                             since_ms: int, end_ms: int,
                             max_errors: int = 5) -> pd.DataFrame:
-    """Fetch funding rate history in chunks."""
+    """Fetch funding rate history. Same advance logic as ohlcv."""
+    print("  [data.py " + _DATA_PY_VERSION + "] fetch_funding_paginated: " + symbol)
+
     all_rates = []
     errors = 0
     is_hl = exchange.id == "hyperliquid"
-
-    if is_hl:
-        # HL: 500 max per call, funding hourly = 500h window per chunk
-        chunk_limit = 500
-        chunk_window_ms = chunk_limit * 60 * 60 * 1000  # 500 hours in ms
-    else:
-        chunk_limit = 1000
-        chunk_window_ms = None
+    # Funding interval (1h on HL, 8h on others)
+    funding_interval_ms = 60 * 60 * 1000 if is_hl else 8 * 60 * 60 * 1000
+    chunk_limit = 500 if is_hl else 1000
+    skip_window_ms = 30 * 24 * 60 * 60 * 1000
+    consecutive_empty = 0
+    max_consecutive_empty = 6
 
     cursor_ms = since_ms
     while cursor_ms < end_ms:
@@ -168,24 +173,21 @@ def fetch_funding_paginated(exchange, symbol: str,
             rates = exchange.fetch_funding_rate_history(symbol, since=cursor_ms, limit=chunk_limit)
             errors = 0
 
-            if is_hl:
-                if rates:
-                    all_rates.extend(rates)
-                    last_ts = rates[-1]["timestamp"]
-                    next_cursor = max(last_ts + 60 * 60 * 1000, cursor_ms + chunk_window_ms)
-                else:
-                    next_cursor = cursor_ms + chunk_window_ms
-                if next_cursor <= cursor_ms:
-                    break
-                cursor_ms = next_cursor
-            else:
-                if not rates:
-                    break
+            if rates and len(rates) > 0:
+                consecutive_empty = 0
                 all_rates.extend(rates)
-                new_cursor = rates[-1]["timestamp"] + 1
+                last_ts = rates[-1]["timestamp"]
+                new_cursor = last_ts + funding_interval_ms
                 if new_cursor <= cursor_ms:
-                    break
+                    new_cursor = cursor_ms + funding_interval_ms * chunk_limit
                 cursor_ms = new_cursor
+            else:
+                consecutive_empty += 1
+                if not is_hl:
+                    break
+                if consecutive_empty >= max_consecutive_empty:
+                    break
+                cursor_ms += skip_window_ms
 
             time.sleep(exchange.rateLimit / 1000)
         except Exception as e:
@@ -197,6 +199,8 @@ def fetch_funding_paginated(exchange, symbol: str,
                     " consecutive errors. Last error: " + str(e)
                 )
             time.sleep(2)
+
+    print("    [done] total funding rates fetched: " + str(len(all_rates)))
 
     if not all_rates:
         return pd.DataFrame()
