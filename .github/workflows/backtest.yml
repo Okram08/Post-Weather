@@ -12,24 +12,53 @@ on:
         required: true
         default: '2025-12-31'
       pairs:
-        description: 'Pairs (comma-separated, ex: BTC/USDT:USDT,ETH/USDT:USDT)'
+        description: 'Pairs (comma-separated, leave empty for config default)'
         required: false
         default: ''
       setup_atr:
-        description: 'Setup ATR extension threshold (override)'
+        description: 'Extension threshold (default 1.5, try 2.5 for stricter)'
+        required: false
+        default: ''
+      rsi_threshold:
+        description: 'RSI oversold threshold (default 30, try 20 for stricter)'
+        required: false
+        default: ''
+      funding_threshold:
+        description: 'Funding rate threshold (default -0.0002)'
+        required: false
+        default: ''
+      adx_max:
+        description: 'ADX max threshold (default 25)'
         required: false
         default: ''
       limit_atr:
-        description: 'Limit order extension (override)'
+        description: 'Limit placement in ATR units (default 2.5)'
+        required: false
+        default: ''
+      stop_atr:
+        description: 'Stop distance in ATR units (default 1.5)'
         required: false
         default: ''
       target_pct:
-        description: 'Target % (override, ex: 0.01)'
+        description: 'Fixed-pct target (only if target_mode=fixed_pct)'
         required: false
         default: ''
-
-permissions:
-  contents: read
+      target_mode:
+        description: 'Target mode: vwap or fixed_pct'
+        required: false
+        default: ''
+      position_max_hours:
+        description: 'Max hold time in hours'
+        required: false
+        default: ''
+      force_no_funding:
+        description: 'Force run without funding filter (true/false)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   backtest:
@@ -38,56 +67,74 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      - run: pip install -r requirements.txt
+      - name: Install deps
+        run: pip install -r requirements.txt
 
       - name: Build args
-        id: args
+        id: build_args
         run: |
-          ARGS="--start ${{ inputs.start_date }} --end ${{ inputs.end_date }}"
-          if [ -n "${{ inputs.pairs }}" ]; then ARGS="$ARGS --pairs ${{ inputs.pairs }}"; fi
-          if [ -n "${{ inputs.setup_atr }}" ]; then ARGS="$ARGS --setup_atr ${{ inputs.setup_atr }}"; fi
-          if [ -n "${{ inputs.limit_atr }}" ]; then ARGS="$ARGS --limit_atr ${{ inputs.limit_atr }}"; fi
-          if [ -n "${{ inputs.target_pct }}" ]; then ARGS="$ARGS --target_pct ${{ inputs.target_pct }}"; fi
+          ARGS="--start ${{ github.event.inputs.start_date }} --end ${{ github.event.inputs.end_date }}"
+          if [ -n "${{ github.event.inputs.pairs }}" ]; then
+            ARGS="$ARGS --pairs ${{ github.event.inputs.pairs }}"
+          fi
+          if [ -n "${{ github.event.inputs.setup_atr }}" ]; then
+            ARGS="$ARGS --setup_atr ${{ github.event.inputs.setup_atr }}"
+          fi
+          if [ -n "${{ github.event.inputs.rsi_threshold }}" ]; then
+            ARGS="$ARGS --rsi_threshold ${{ github.event.inputs.rsi_threshold }}"
+          fi
+          if [ -n "${{ github.event.inputs.funding_threshold }}" ]; then
+            ARGS="$ARGS --funding_threshold ${{ github.event.inputs.funding_threshold }}"
+          fi
+          if [ -n "${{ github.event.inputs.adx_max }}" ]; then
+            ARGS="$ARGS --adx_max ${{ github.event.inputs.adx_max }}"
+          fi
+          if [ -n "${{ github.event.inputs.limit_atr }}" ]; then
+            ARGS="$ARGS --limit_atr ${{ github.event.inputs.limit_atr }}"
+          fi
+          if [ -n "${{ github.event.inputs.stop_atr }}" ]; then
+            ARGS="$ARGS --stop_atr ${{ github.event.inputs.stop_atr }}"
+          fi
+          if [ -n "${{ github.event.inputs.target_pct }}" ]; then
+            ARGS="$ARGS --target_pct ${{ github.event.inputs.target_pct }}"
+          fi
+          if [ -n "${{ github.event.inputs.target_mode }}" ]; then
+            ARGS="$ARGS --target_mode ${{ github.event.inputs.target_mode }}"
+          fi
+          if [ -n "${{ github.event.inputs.position_max_hours }}" ]; then
+            ARGS="$ARGS --position_max_hours ${{ github.event.inputs.position_max_hours }}"
+          fi
+          if [ "${{ github.event.inputs.force_no_funding }}" = "true" ]; then
+            ARGS="$ARGS --force_no_funding"
+          fi
           echo "args=$ARGS" >> $GITHUB_OUTPUT
+          echo "Built args: $ARGS"
 
       - name: Run backtest
-        run: python -m src.backtest ${{ steps.args.outputs.args }}
+        run: python -m src.backtest ${{ steps.build_args.outputs.args }}
 
       - name: Upload artifacts
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results-${{ github.run_id }}
           path: backtest_results/
-          retention-days: 30
 
-      - name: Send summary to Telegram
+      - name: Send Telegram summary
         if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python <<'PY'
-          import os, requests
-          from pathlib import Path
-          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-          chat = os.environ.get("TELEGRAM_CHAT_ID", "")
-          if not (token and chat):
-              print("[telegram] missing creds"); exit(0)
-          summary_path = Path("backtest_results/summary.txt")
-          summary = summary_path.read_text() if summary_path.exists() else "No summary produced."
-          if len(summary) > 3500:
-              summary = summary[:3500] + "\n... (truncated)"
-          msg = f"📊 *Backtest done*\n\n```\n{summary}\n```"
-          r = requests.post(
-              f"https://api.telegram.org/bot{token}/sendMessage",
-              json={"chat_id": chat, "text": msg, "parse_mode": "Markdown"},
-              timeout=10,
-          )
-          print(r.status_code, r.text[:200])
-          PY
+          if [ -f backtest_results/summary.txt ]; then
+            SUMMARY=$(cat backtest_results/summary.txt)
+            MESSAGE="🔬 Backtest done%0A%0A\`\`\`%0A${SUMMARY}%0A\`\`\`"
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              -d "text=${MESSAGE}" \
+              -d "parse_mode=Markdown" || true
+          fi
