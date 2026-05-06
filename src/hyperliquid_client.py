@@ -4,14 +4,11 @@ Wraps the official hyperliquid-python-sdk with safety guardrails:
   - HARDCODED max notional per order ($200) - cannot be overridden by config
   - HARDCODED max leverage (5x) - same
   - All orders idempotent via cloid (client order id)
-  - Bracket orders placed atomically (entry + stop + target as TP/SL group)
+  - Supports limit orders (entry) AND trigger orders (stop, target)
 
 API wallet model:
   - api_private_key: signs the orders (the "agent" key, trade-only scope)
   - main_address: the wallet that holds the funds and positions
-  - Funds and positions stay in main wallet, agent only signs trades on behalf
-
-Auth: HL uses EIP-712 signing, the SDK handles it from the private key.
 """
 import os
 import time
@@ -27,10 +24,9 @@ from hyperliquid.utils.types import Cloid
 
 
 # ===== HARD LIMITS - DO NOT MOVE TO CONFIG =====
-# Even if config or signal asks more, we refuse.
 MAX_NOTIONAL_USD_PER_ORDER = 200.0
 MAX_LEVERAGE_ALLOWED = 5.0
-MIN_ORDER_USD = 10.0  # HL exchange minimum
+MIN_ORDER_USD = 10.0
 # ================================================
 
 
@@ -39,18 +35,6 @@ class HLLimitExceeded(Exception):
 
 
 class HyperliquidClient:
-    """Safe Hyperliquid execution client.
-
-    Usage:
-        client = HyperliquidClient(
-            api_private_key=os.getenv("HL_API_PRIVATE_KEY"),
-            main_address=os.getenv("HL_MAIN_ADDRESS"),
-        )
-        client.get_balance()
-        client.get_positions()
-        client.get_mark_price("BTC")
-    """
-
     def __init__(self, api_private_key: str, main_address: str,
                  testnet: bool = False):
         if not api_private_key:
@@ -63,7 +47,6 @@ class HyperliquidClient:
         self.main_address = main_address
         base_url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
 
-        # The agent wallet - signs orders
         self.agent_account = Account.from_key(api_private_key)
         self.agent_address = self.agent_account.address
 
@@ -71,7 +54,7 @@ class HyperliquidClient:
         self.exchange = Exchange(
             wallet=self.agent_account,
             base_url=base_url,
-            account_address=main_address,  # acts on behalf of main
+            account_address=main_address,
         )
 
         print("[hl_client] initialized")
@@ -79,14 +62,15 @@ class HyperliquidClient:
         print("  main address:  " + self.main_address)
         print("  base url:      " + base_url)
 
-    # ---- Read-only methods (safe) ----
+    # ---- Read-only methods ----
 
     def get_user_state(self) -> dict:
-        """Full user state: balance, positions, margin, etc."""
         return self.info.user_state(self.main_address)
 
     def get_balance(self) -> dict:
-        """Returns {'account_value': x, 'available_to_trade': y, 'margin_used': z}."""
+        """Returns Perps margin summary. NOTE: with Unified Account this may
+        show $0 even when spot USDC is available as margin. The actual
+        execution still works (verified with test_hl_order)."""
         state = self.get_user_state()
         margin = state.get("marginSummary", {})
         return {
@@ -96,8 +80,18 @@ class HyperliquidClient:
             "withdrawable_usd": float(state.get("withdrawable", 0)),
         }
 
+    def get_spot_balance(self, coin: str = "USDC") -> float:
+        """Get the spot balance for a given coin."""
+        try:
+            spot = self.info.spot_user_state(self.main_address)
+            for b in spot.get("balances", []):
+                if b.get("coin") == coin:
+                    return float(b.get("total", 0))
+        except Exception as e:
+            print("[hl_client] get_spot_balance error: " + str(e))
+        return 0.0
+
     def get_positions(self) -> list:
-        """Returns list of open positions."""
         state = self.get_user_state()
         positions = []
         for ap in state.get("assetPositions", []):
@@ -119,26 +113,28 @@ class HyperliquidClient:
         return positions
 
     def get_mark_price(self, coin: str) -> float:
-        """Mark price for a coin (e.g. 'BTC', 'ETH', 'SOL')."""
         mids = self.info.all_mids()
         if coin not in mids:
-            raise ValueError("coin '" + coin + "' not found in mids. "
-                             "Sample: " + str(list(mids.keys())[:10]))
+            raise ValueError("coin '" + coin + "' not found")
         return float(mids[coin])
 
     def get_open_orders(self) -> list:
-        """Returns list of open (resting) orders for main address."""
         return self.info.open_orders(self.main_address)
 
-    # ---- Validation (used before any write) ----
+    def query_order_status(self, oid: int) -> dict:
+        """Query order status by oid. Returns dict with 'order' and 'status' fields."""
+        try:
+            return self.info.query_order_by_oid(self.main_address, oid)
+        except Exception as e:
+            return {"error": str(e)}
 
-    def _validate_order(self, coin: str, is_buy: bool, sz: float,
-                        limit_px: float):
-        """Hard safety checks. Raises HLLimitExceeded on violation."""
+    # ---- Validation ----
+
+    def _validate_order(self, coin: str, sz: float, limit_px: float):
         if sz <= 0:
-            raise HLLimitExceeded("size must be > 0, got " + str(sz))
+            raise HLLimitExceeded("size must be > 0")
         if limit_px <= 0:
-            raise HLLimitExceeded("limit_px must be > 0, got " + str(limit_px))
+            raise HLLimitExceeded("limit_px must be > 0")
 
         notional = abs(sz * limit_px)
         if notional > MAX_NOTIONAL_USD_PER_ORDER:
@@ -152,60 +148,132 @@ class HyperliquidClient:
                     notional, MIN_ORDER_USD)
             )
 
-        # Sanity check on price: must be within 50% of mark price
         try:
             mark = self.get_mark_price(coin)
+            if abs(limit_px - mark) / mark > 0.5:
+                raise HLLimitExceeded(
+                    "limit_px {:.4f} differs by >50% from mark {:.4f}".format(
+                        limit_px, mark)
+                )
+        except HLLimitExceeded:
+            raise
         except Exception:
-            return  # if we can't fetch mark, allow (rare)
-        if abs(limit_px - mark) / mark > 0.5:
-            raise HLLimitExceeded(
-                "limit_px {:.4f} differs by >50% from mark {:.4f}".format(
-                    limit_px, mark)
-            )
+            pass  # if we can't fetch mark, allow
 
-    # ---- Write methods ----
+    # ---- Write methods: limit order (entry) ----
 
     def place_limit_order(self, coin: str, is_buy: bool, sz: float,
                           limit_px: float, reduce_only: bool = False,
                           cloid_str: Optional[str] = None,
                           post_only: bool = True) -> dict:
-        """Place a single limit order. Validates against hard limits first."""
-        self._validate_order(coin, is_buy, sz, limit_px)
+        """Place a limit order. post_only=True uses Alo (maker-only)."""
+        self._validate_order(coin, sz, limit_px)
 
-        cloid = None
-        if cloid_str:
-            cloid = Cloid.from_str(cloid_str)
-        else:
-            cloid = Cloid.from_str("0x" + uuid.uuid4().hex)
+        if cloid_str is None:
+            cloid_str = "0x" + uuid.uuid4().hex
+        cloid = Cloid.from_str(cloid_str)
 
         order_type: OrderType = {
             "limit": {"tif": "Alo" if post_only else "Gtc"}
-            # Alo = Add Liquidity Only (post-only, maker-only fee)
-            # Gtc = Good Till Cancelled
         }
 
         print("[hl_client] place_limit_order: "
               + ("BUY" if is_buy else "SELL") + " " + coin
-              + " size=" + str(sz) + " px=" + str(limit_px)
+              + " sz=" + str(sz) + " px=" + str(limit_px)
               + " notional=${:.2f}".format(abs(sz * limit_px))
+              + " " + ("Alo" if post_only else "Gtc")
               + " cloid=" + cloid.to_raw())
 
-        result = self.exchange.order(
-            name=coin,
-            is_buy=is_buy,
-            sz=sz,
-            limit_px=limit_px,
-            order_type=order_type,
-            reduce_only=reduce_only,
-            cloid=cloid,
+        return self.exchange.order(
+            name=coin, is_buy=is_buy, sz=sz, limit_px=limit_px,
+            order_type=order_type, reduce_only=reduce_only, cloid=cloid,
         )
-        return result
+
+    # ---- Write methods: trigger order (stop / target) ----
+
+    def place_stop_market(self, coin: str, is_buy: bool, sz: float,
+                          trigger_px: float,
+                          cloid_str: Optional[str] = None) -> dict:
+        """Place a Stop Market order (becomes market when trigger hit).
+
+        For a LONG position: is_buy=False, trigger_px = stop_loss_price (below entry)
+        For a SHORT position: is_buy=True, trigger_px = stop_loss_price (above entry)
+
+        is_buy refers to the EXIT direction (closing the position).
+        Always reduce_only=True.
+        """
+        if trigger_px <= 0:
+            raise HLLimitExceeded("trigger_px must be > 0")
+        if sz <= 0:
+            raise HLLimitExceeded("size must be > 0")
+
+        # Sanity: trigger should be within 30% of mark
+        try:
+            mark = self.get_mark_price(coin)
+            if abs(trigger_px - mark) / mark > 0.3:
+                raise HLLimitExceeded(
+                    "trigger_px {:.4f} differs >30% from mark {:.4f}".format(
+                        trigger_px, mark)
+                )
+        except HLLimitExceeded:
+            raise
+        except Exception:
+            pass
+
+        if cloid_str is None:
+            cloid_str = "0x" + uuid.uuid4().hex
+        cloid = Cloid.from_str(cloid_str)
+
+        order_type: OrderType = {
+            "trigger": {
+                "triggerPx": trigger_px,
+                "isMarket": True,
+                "tpsl": "sl",
+            }
+        }
+
+        # When trigger fires, market order: limit_px is just a worst-case slippage limit.
+        # For a stop SELL (closing long), set limit_px far below trigger.
+        # For a stop BUY (closing short), set limit_px far above trigger.
+        if is_buy:
+            # closing short: market BUY at any price up to +20%
+            slippage_limit = trigger_px * 1.20
+        else:
+            # closing long: market SELL at any price down to -20%
+            slippage_limit = trigger_px * 0.80
+
+        print("[hl_client] place_stop_market: "
+              + ("BUY" if is_buy else "SELL") + " " + coin
+              + " sz=" + str(sz) + " trigger=$" + str(trigger_px)
+              + " (reduce_only)"
+              + " cloid=" + cloid.to_raw())
+
+        return self.exchange.order(
+            name=coin, is_buy=is_buy, sz=sz, limit_px=slippage_limit,
+            order_type=order_type, reduce_only=True, cloid=cloid,
+        )
+
+    def place_take_profit_limit(self, coin: str, is_buy: bool, sz: float,
+                                 limit_px: float,
+                                 cloid_str: Optional[str] = None) -> dict:
+        """Place a Take Profit as a regular limit order (post-only).
+
+        For a LONG position: is_buy=False, limit_px = target (above entry)
+        For a SHORT position: is_buy=True, limit_px = target (below entry)
+
+        Always reduce_only=True. post-only for maker fee.
+        """
+        return self.place_limit_order(
+            coin=coin, is_buy=is_buy, sz=sz, limit_px=limit_px,
+            reduce_only=True, cloid_str=cloid_str, post_only=True,
+        )
+
+    # ---- Cancel ----
 
     def cancel_order(self, coin: str, oid: int) -> dict:
         return self.exchange.cancel(coin, oid)
 
     def cancel_all_orders(self, coin: Optional[str] = None) -> list:
-        """Cancel all open orders, optionally filtered by coin."""
         orders = self.get_open_orders()
         results = []
         for o in orders:
