@@ -1,0 +1,29 @@
+name: Test HL Order
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test_hl_order:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          pip install hyperliquid-python-sdk
+
+      - name: Run HL order test
+        env:
+          HL_API_PRIVATE_KEY: ${{ secrets.HL_API_PRIVATE_KEY }}
+          HL_MAIN_ADDRESS: ${{ secrets.HL_MAIN_ADDRESS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m src.test_hl_order
