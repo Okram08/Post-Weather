@@ -1,5 +1,8 @@
 # crypto-trading-bot configuration
-# Live test phase, $100 bankroll on Hyperliquid (Perps)
+# Spot-equivalent mode (leverage 1.0x on Hyperliquid Perps)
+# - Max 20% of bankroll per single trade
+# - Up to 5 concurrent positions across pairs
+# - Min order $10 (HL exchange limit)
 
 strategy:
   pairs:
@@ -24,10 +27,14 @@ strategy:
 
 bankroll:
   initial_capital_usd: 100.0
-  risk_per_trade_pct: 0.02
-  max_concurrent_positions: 1
-  max_leverage: 3.0
+  # Risk 0.4% per trade -> notional ~$20 on avg volatility
+  # Notional is also capped at 20% of bankroll (executor.py)
+  # AND at bankroll * max_leverage (= bankroll itself with leverage 1x)
+  risk_per_trade_pct: 0.004
+  max_concurrent_positions: 5
+  max_leverage: 1.0               # spot-equivalent
 
+  # Circuit breakers
   daily_loss_limit_pct: 0.05
   max_drawdown_pct: 0.20
 
@@ -36,9 +43,8 @@ bankroll:
 
 frictions:
   exchange: hyperliquid
-  # Real fees from your HL account (visible in Portfolio screen):
-  maker_fee_bps: 1.44             # 0.0144% maker
-  taker_fee_bps: 4.32             # 0.0432% taker
+  maker_fee_bps: 1.44
+  taker_fee_bps: 4.32
 
 telegram:
   enabled: true
