@@ -8,8 +8,6 @@ Flow per scan (every 4h):
   5. For each pair: fetch data, detect setup, gates check, size, execute.
   6. Persist state.
   7. Send heartbeat.
-
-Heartbeat is always sent at the end so the user knows the bot is alive.
 """
 import sys
 import traceback
@@ -88,7 +86,6 @@ def _format_heartbeat(bankroll, inspected, emitted_count, rejected_count,
             + " | *Executed:* " + str(executed_count),
     ]
 
-    # Reconcile events (fills, stops, timeouts from previous scans)
     if reconcile_events:
         lines.append("")
         lines.append("*Position events this scan:*")
@@ -110,15 +107,17 @@ def _format_heartbeat(bankroll, inspected, emitted_count, rejected_count,
                 line += " @$" + str(ev["exit_price"])
             lines.append(line)
 
-    # Active position details
     if open_positions:
         lines.append("")
         lines.append("*Active positions:*")
         for p in open_positions:
             tag = "[" + p.get("status", "?").upper() + "]"
             d = p.get("direction", "?").upper()
+            lev = p.get("leverage_used")
+            extra = " " + ("{:.2f}x".format(lev) if lev else "")
             lines.append(
                 "  " + tag + " " + p.get("pair", "?") + " " + d
+                + extra
                 + " size=" + str(p.get("size"))
                 + " limit=$" + str(p.get("limit_price"))
                 + " stop=$" + str(p.get("stop_price"))
@@ -154,6 +153,30 @@ def _send_heartbeat(cfg, bankroll, inspected, emitted_count, rejected_count,
         print("[heartbeat] failed: " + str(e))
 
 
+def _format_event_message(ev: dict) -> str:
+    e_type = ev.get("event", "?")
+    sig_id = ev.get("signal_id", "?")
+    titles = {
+        "entry_filled": "*POSITION OPENED*",
+        "stop_hit": "*STOP HIT*",
+        "target_hit": "*TARGET HIT - WIN*",
+        "entry_expired": "*ENTRY EXPIRED (8h)*",
+        "entry_vanished": "*ENTRY VANISHED*",
+        "position_timeout": "*POSITION TIMEOUT (48h)*",
+    }
+    title = titles.get(e_type, "*EVENT*")
+    lines = [title, "Signal: `" + sig_id + "`"]
+    if "fill_price" in ev:
+        lines.append("Fill price: $" + str(ev["fill_price"]))
+    if "exit_price" in ev:
+        lines.append("Exit price: $" + str(ev["exit_price"]))
+    if "pnl_usd" in ev:
+        pnl = ev["pnl_usd"]
+        sign = "+" if pnl >= 0 else ""
+        lines.append("PnL: " + sign + "${:.2f}".format(pnl))
+    return "\n".join(lines)
+
+
 def run() -> int:
     inspected = []
     n_emitted = 0
@@ -185,10 +208,8 @@ def run() -> int:
                          "Cannot load bankroll: `" + str(e) + "`")
         return 1
 
-    # Convert bankroll to a mutable dict for executor compatibility
+    # Convert bankroll to mutable dict for executor
     if hasattr(bankroll, "__dict__"):
-        # It's a dataclass / object - convert to dict for executor
-        # but we still need to save_bankroll(gist, bankroll) which expects original type
         bankroll_dict = {
             "equity_usd": getattr(bankroll, "equity_usd", cfg.bankroll.initial_capital_usd),
             "peak_equity_usd": getattr(bankroll, "peak_equity_usd",
@@ -204,15 +225,23 @@ def run() -> int:
         bankroll_dict.setdefault("open_positions", [])
         is_dataclass = False
 
-    # ---- Init HL client ----
+    # CRITICAL: inject max_leverage so executor can compute the dynamic cap
+    bankroll_dict["_max_leverage"] = float(cfg.bankroll.max_leverage)
+
+    # Init HL client
     hl_client = make_client_from_env()
     hl_connected = hl_client is not None
     if hl_connected:
         print("[scanner] HL client connected, LIVE EXECUTION mode")
+        print("[scanner] equity=${:.2f}, max_leverage={:.1f}x, "
+              "max_notional=${:.2f}".format(
+                  bankroll_dict["equity_usd"],
+                  bankroll_dict["_max_leverage"],
+                  bankroll_dict["equity_usd"] * bankroll_dict["_max_leverage"]))
     else:
         print("[scanner] HL client NOT configured, PAPER mode (signals only)")
 
-    # ---- Reconcile open positions on HL ----
+    # Reconcile open positions on HL
     if hl_client and bankroll_dict.get("open_positions"):
         print("[scanner] reconciling " + str(len(bankroll_dict["open_positions"]))
               + " open positions...")
@@ -220,7 +249,6 @@ def run() -> int:
             reconcile_events = reconcile_positions(hl_client, bankroll_dict)
             for ev in reconcile_events:
                 print("[reconcile] " + str(ev))
-                # Push individual fill/exit events to Telegram
                 if cfg.telegram.enabled:
                     try:
                         send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
@@ -231,7 +259,7 @@ def run() -> int:
             print("[scanner] reconcile failed: " + str(e))
             traceback.print_exc()
 
-    # ---- Sync bankroll dict back to bankroll object ----
+    # Sync back
     if is_dataclass:
         bankroll.equity_usd = bankroll_dict["equity_usd"]
         bankroll.peak_equity_usd = bankroll_dict["peak_equity_usd"]
@@ -240,25 +268,21 @@ def run() -> int:
         bankroll.halt_reason = bankroll_dict["halt_reason"]
         bankroll.open_positions = bankroll_dict["open_positions"]
 
-    # ---- Halted check ----
+    # Halted check
     if bankroll_dict.get("halted"):
         if cfg.telegram.enabled:
             send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
                          format_halt(bankroll_dict.get("halt_reason", "")))
         for pair in cfg.strategy.pairs:
-            inspected.append({
-                "pair": pair, "status": "halted",
-                "detail": "scanner halted",
-            })
+            inspected.append({"pair": pair, "status": "halted",
+                              "detail": "scanner halted"})
         save_bankroll(gist, bankroll)
         _send_heartbeat(cfg, bankroll, inspected, 0, 0, 0,
                         reconcile_events, hl_connected)
         print("[halt] " + str(bankroll_dict.get("halt_reason", "")))
         return 0
 
-    # ---- Idempotency set ----
     emitted = set(gist.read("emitted_signals.json").get("ids", []))
-
     exchange = make_exchange(cfg.frictions.exchange)
 
     bankroll_params = {
@@ -296,7 +320,6 @@ def run() -> int:
                 continue
 
             current_price = float(ohlc_1h["close"].iloc[-1])
-
             signal = detect_setup_a(last_bar, pair, current_price,
                                     cfg.strategy.setup_a)
 
@@ -338,16 +361,13 @@ def run() -> int:
                 })
                 continue
 
-            # Sizing accepted -> emit signal Telegram
             msg = format_signal(signal, sizing, bankroll)
             if cfg.telegram.enabled:
                 send_message(cfg.telegram.bot_token, cfg.telegram.chat_id, msg)
             n_emitted += 1
             emitted.add(sig_id)
 
-            # ---- EXECUTE on HL ----
             if hl_client is None:
-                # Paper mode
                 inspected.append({"pair": pair, "status": "setup-" + direction,
                                   "detail": "EMITTED " + sig_id + " (PAPER)"})
                 gist.append_log("signals_log.json", {
@@ -356,7 +376,6 @@ def run() -> int:
                 })
                 print("[" + pair + "] EMITTED (paper) " + sig_id)
             else:
-                # Live execution
                 exec_result = execute_signal(hl_client, signal, sizing,
                                               bankroll_dict)
                 if exec_result["ok"]:
@@ -364,30 +383,38 @@ def run() -> int:
                     bankroll_dict["open_positions"].append(exec_result["position"])
                     if is_dataclass:
                         bankroll.open_positions = bankroll_dict["open_positions"]
+                    pos = exec_result["position"]
                     inspected.append({
                         "pair": pair, "status": "setup-" + direction,
-                        "detail": "EXECUTED entry_oid="
-                                  + str(exec_result["position"]["entry_oid"]),
+                        "detail": "EXECUTED notional=${:.2f} lev={:.2f}x".format(
+                            pos.get("notional_usd", 0),
+                            pos.get("leverage_used", 0)),
                     })
                     gist.append_log("signals_log.json", {
                         "id": sig_id, "pair": pair, "direction": direction,
                         "status": "executed",
-                        "entry_oid": exec_result["position"]["entry_oid"],
-                        "stop_oid": exec_result["position"]["stop_oid"],
-                        "limit": exec_result["position"]["limit_price"],
-                        "stop": exec_result["position"]["stop_price"],
-                        "target": exec_result["position"]["target_price"],
-                        "size": exec_result["position"]["size"],
+                        "entry_oid": pos["entry_oid"],
+                        "stop_oid": pos["stop_oid"],
+                        "limit": pos["limit_price"],
+                        "stop": pos["stop_price"],
+                        "target": pos["target_price"],
+                        "size": pos["size"],
+                        "notional_usd": pos.get("notional_usd"),
+                        "leverage_used": pos.get("leverage_used"),
                     })
                     if cfg.telegram.enabled:
                         send_message(
                             cfg.telegram.bot_token, cfg.telegram.chat_id,
-                            "[EXECUTED] " + sig_id + "\nentry_oid=`"
-                            + str(exec_result["position"]["entry_oid"])
-                            + "`\nstop_oid=`"
-                            + str(exec_result["position"]["stop_oid"]) + "`"
+                            "[EXECUTED] " + sig_id + "\n"
+                            + "notional=$" + "{:.2f}".format(pos.get("notional_usd", 0))
+                            + "\nleverage=" + "{:.2f}x".format(pos.get("leverage_used", 0))
+                            + "\nentry_oid=`" + str(pos["entry_oid"])
+                            + "`\nstop_oid=`" + str(pos["stop_oid"]) + "`"
                         )
-                    print("[" + pair + "] EXECUTED " + sig_id)
+                    print("[" + pair + "] EXECUTED " + sig_id
+                          + " notional=${:.2f} lev={:.2f}x".format(
+                              pos.get("notional_usd", 0),
+                              pos.get("leverage_used", 0)))
                 else:
                     inspected.append({
                         "pair": pair, "status": "setup-" + direction,
@@ -417,14 +444,12 @@ def run() -> int:
                 send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
                              format_error(pair, err))
 
-    # ---- Sync bankroll dict back ----
     if is_dataclass:
         bankroll.equity_usd = bankroll_dict["equity_usd"]
         bankroll.peak_equity_usd = bankroll_dict["peak_equity_usd"]
         bankroll.daily_pnl_usd = bankroll_dict["daily_pnl_usd"]
         bankroll.open_positions = bankroll_dict["open_positions"]
 
-    # ---- Persist ----
     try:
         gist.write("emitted_signals.json", {"ids": list(emitted)[-500:]})
         save_bankroll(gist, bankroll)
@@ -445,33 +470,6 @@ def run() -> int:
           + ", Executed: " + str(n_executed)
           + ", Reconcile events: " + str(len(reconcile_events)))
     return 0
-
-
-def _format_event_message(ev: dict) -> str:
-    """Format a single reconcile event for Telegram."""
-    e_type = ev.get("event", "?")
-    sig_id = ev.get("signal_id", "?")
-
-    titles = {
-        "entry_filled": "*POSITION OPENED*",
-        "stop_hit": "*STOP HIT*",
-        "target_hit": "*TARGET HIT - WIN*",
-        "entry_expired": "*ENTRY EXPIRED (8h)*",
-        "entry_vanished": "*ENTRY VANISHED*",
-        "position_timeout": "*POSITION TIMEOUT (48h)*",
-    }
-    title = titles.get(e_type, "*EVENT*")
-
-    lines = [title, "Signal: `" + sig_id + "`"]
-    if "fill_price" in ev:
-        lines.append("Fill price: $" + str(ev["fill_price"]))
-    if "exit_price" in ev:
-        lines.append("Exit price: $" + str(ev["exit_price"]))
-    if "pnl_usd" in ev:
-        pnl = ev["pnl_usd"]
-        sign = "+" if pnl >= 0 else ""
-        lines.append("PnL: " + sign + "${:.2f}".format(pnl))
-    return "\n".join(lines)
 
 
 if __name__ == "__main__":
