@@ -2,18 +2,19 @@ name: Scan
 
 on:
   schedule:
-    - cron: '0 */4 * * *'  # every 4 hours
-  workflow_dispatch:
+    # Every 30 minutes - scanner is unified now (always reconciles,
+    # full scan only when new 4h bar closes).
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
