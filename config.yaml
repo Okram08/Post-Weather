@@ -1,14 +1,24 @@
 # crypto-trading-bot configuration
 # Spot-equivalent mode (leverage 1.0x on Hyperliquid Perps)
+# - 9 pairs scanned: 3 majors + 6 alts
 # - Max 20% of bankroll per single trade
-# - Up to 5 concurrent positions across pairs
+# - Up to 5 concurrent positions
 # - Min order $10 (HL exchange limit)
 
 strategy:
   pairs:
+    # Tier 1 : majors
     - "BTC/USDC:USDC"
     - "ETH/USDC:USDC"
     - "SOL/USDC:USDC"
+    # Tier 2 : HL native + L1 mature
+    - "HYPE/USDC:USDC"
+    - "AVAX/USDC:USDC"
+    - "LINK/USDC:USDC"
+    # Tier 3 : L2s
+    - "ARB/USDC:USDC"
+    - "OP/USDC:USDC"
+    - "POL/USDC:USDC"        # if HL still uses MATIC, change to "MATIC/USDC:USDC"
 
   setup_a:
     setup_atr_extension: 1.0
@@ -27,14 +37,10 @@ strategy:
 
 bankroll:
   initial_capital_usd: 100.0
-  # Risk 0.4% per trade -> notional ~$20 on avg volatility
-  # Notional is also capped at 20% of bankroll (executor.py)
-  # AND at bankroll * max_leverage (= bankroll itself with leverage 1x)
-  risk_per_trade_pct: 0.004
+  risk_per_trade_pct: 0.004        # 0.4% -> ~$20 notional, capped at 20%
   max_concurrent_positions: 5
-  max_leverage: 1.0               # spot-equivalent
+  max_leverage: 1.0                # spot-equivalent
 
-  # Circuit breakers
   daily_loss_limit_pct: 0.05
   max_drawdown_pct: 0.20
 
