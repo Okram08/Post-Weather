@@ -1,26 +1,18 @@
 """Hyperliquid execution layer.
 
 Bridges scanner -> HL: when scanner detects a Setup A signal AND the bankroll
-gates pass, executor.execute_signal() is called. It:
+gates pass, executor.execute_signal() is called.
 
-  1. Computes order size from notional (signal.notional_usd)
-  2. Places the ENTRY limit order (post-only, maker fee)
-  3. Places the STOP MARKET trigger order (reduce_only, taker fee on fill)
-  4. The TARGET will be placed only AFTER the entry fills, by reconcile_positions
-     (this avoids the case where target fills before entry due to spread).
-  5. Records all OIDs in the gist position record so reconcile_positions can
-     monitor the lifecycle.
-
-reconcile_positions() runs at every scan and:
-  - Cancels stale entry orders (> 8h old, never filled)
-  - When entry just filled: places the target order
-  - Detects when stop or target was filled: closes the position, updates bankroll PnL
-  - Detects time-out at 48h: forces a market close
-
-Pair format: "BTC/USDC:USDC" -> coin "BTC" (HL uses just the asset name).
+NOTIONAL CAP (per trade) = MIN of:
+  1. equity * MAX_NOTIONAL_PCT_PER_TRADE  (HARDCODED 20%)
+  2. equity * max_leverage (from config, 1.0 = no leverage)
+  3. EXECUTOR_HARD_NOTIONAL_CEILING (HARDCODED $500 absolute floor)
+This guarantees:
+  - No single trade > 20% of bankroll
+  - No leverage above config setting
+  - Even with bug, notional capped at $500 absolute
 """
 import os
-import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -29,46 +21,29 @@ from src.hyperliquid_client import HyperliquidClient, HLLimitExceeded
 
 
 # ===== EXECUTOR LIMITS =====
-# Notional cap is DYNAMIC: bankroll * max_leverage_from_config (3x by default).
-# This guarantees leverage never exceeds the configured max.
-# Hard upper bound is enforced by hyperliquid_client.py at $200 anyway.
-EXECUTOR_MAX_OPEN_POSITIONS = 1
+MAX_NOTIONAL_PCT_PER_TRADE = 0.20    # max 20% of bankroll per single trade
+EXECUTOR_HARD_NOTIONAL_CEILING = 500.0
 ENTRY_VALIDITY_HOURS = 8
 POSITION_MAX_HOURS = 48
-# An absolute floor: never let a single trade exceed this even if config drifts
-EXECUTOR_HARD_NOTIONAL_CEILING = 500.0
+HL_MIN_NOTIONAL = 10.0
 # ============================
 
 
 def pair_to_coin(pair: str) -> str:
-    """'BTC/USDC:USDC' -> 'BTC'."""
     return pair.split("/")[0]
 
 
 def _round_size(coin: str, sz: float) -> float:
-    """Round position size to HL-compatible precision per coin.
-
-    HL uses asset-specific szDecimals. For our 3 pairs:
-      BTC: 5 decimals, ETH: 4 decimals, SOL: 2 decimals.
-    """
     decimals = {"BTC": 5, "ETH": 4, "SOL": 2}.get(coin, 4)
     return round(sz, decimals)
 
 
 def _round_price(coin: str, px: float) -> float:
-    """Round price to HL tick size per coin.
-
-    HL has price tick: 5 significant digits, max 6 decimals for most coins.
-    For simplicity we round to a per-coin tick:
-      BTC: $1, ETH: $0.1, SOL: $0.01
-    """
     tick = {"BTC": 1.0, "ETH": 0.1, "SOL": 0.01}.get(coin, 0.01)
     return round(round(px / tick) * tick, 6)
 
 
 def make_client_from_env() -> Optional[HyperliquidClient]:
-    """Returns None if HL credentials not configured (paper mode).
-    Returns a connected HyperliquidClient otherwise."""
     api_key = os.environ.get("HL_API_PRIVATE_KEY", "").strip()
     main_addr = os.environ.get("HL_MAIN_ADDRESS", "").strip()
     if not api_key or not main_addr:
@@ -86,49 +61,15 @@ def make_client_from_env() -> Optional[HyperliquidClient]:
 
 def execute_signal(client: HyperliquidClient, signal, sizing,
                    bankroll_state: dict) -> dict:
-    """Place entry limit + stop trigger on HL.
-
-    Returns a dict with execution status, OIDs, and a position record to
-    persist in the gist bankroll state.
-
-    Args:
-      client: a connected HyperliquidClient
-      signal: a Signal object (from src.setups). Has fields: pair, direction,
-              limit_price, stop_price, target_price, signal_id, current_price.
-      sizing: a Sizing object (from src.bankroll). Has fields: notional_usd,
-              accept, reason.
-      bankroll_state: current dict from gist, used to count open positions.
-
-    Returns:
-      {
-        "ok": bool,
-        "reason": str (if not ok),
-        "position": {  # to add to bankroll_state["open_positions"]
-            "signal_id": str,
-            "pair": str,
-            "direction": "long" or "short",
-            "size": float,
-            "entry_oid": int,
-            "stop_oid": int,
-            "target_oid": int or None,  # None until entry fills
-            "limit_price": float,
-            "stop_price": float,
-            "target_price": float,
-            "opened_at": ISO string,
-            "filled_at": null,
-            "status": "pending_entry",
-        }
-      }
-    """
+    """Place entry limit + stop trigger on HL."""
     coin = pair_to_coin(signal.pair)
     direction = signal.direction
     limit_px = _round_price(coin, signal.limit_price)
     stop_px = _round_price(coin, signal.stop_price)
     target_px = _round_price(coin, signal.target_price)
 
-    # Sanity check the geometry of the order
+    # Geometry validation
     if direction == "long":
-        # entry is below current_price, stop below entry, target above entry
         if not (stop_px < limit_px < target_px):
             return {"ok": False,
                     "reason": "long: must have stop<limit<target, got "
@@ -143,43 +84,49 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
     else:
         return {"ok": False, "reason": "unknown direction: " + str(direction)}
 
-    # Notional cap = DYNAMIC based on bankroll * max_leverage (typically 3x).
-    # This is THE safety: leverage is mathematically capped here.
     notional = float(sizing.notional_usd)
     equity = float(bankroll_state.get("equity_usd", 0.0))
-    max_leverage = float(bankroll_state.get("_max_leverage", 3.0))
-    dynamic_cap = equity * max_leverage
-    effective_cap = min(dynamic_cap, EXECUTOR_HARD_NOTIONAL_CEILING)
+    max_leverage = float(bankroll_state.get("_max_leverage", 1.0))
+
+    # ===== NOTIONAL CAPS =====
+    pct_cap = equity * MAX_NOTIONAL_PCT_PER_TRADE  # 20% per trade
+    leverage_cap = equity * max_leverage             # leverage cap
+    effective_cap = min(pct_cap, leverage_cap, EXECUTOR_HARD_NOTIONAL_CEILING)
 
     if notional > effective_cap:
-        # Clamp the notional down rather than reject (we honor the leverage cap)
-        clamped_notional = effective_cap
-        print("[executor] notional ${:.2f} would exceed leverage cap "
-              "(equity=${:.2f} * {:.1f}x = ${:.2f}), clamping to ${:.2f}".format(
-                  notional, equity, max_leverage, dynamic_cap, clamped_notional))
-        notional = clamped_notional
+        # Identify which cap is binding for clarity in logs
+        if pct_cap == effective_cap:
+            cap_reason = "20% per trade cap"
+        elif leverage_cap == effective_cap:
+            cap_reason = "{}x leverage cap".format(max_leverage)
+        else:
+            cap_reason = "absolute ceiling"
+        print("[executor] notional ${:.2f} clamped to ${:.2f} ({})".format(
+            notional, effective_cap, cap_reason))
+        notional = effective_cap
 
-    if notional < 10.0:  # HL minimum
+    if notional < HL_MIN_NOTIONAL:
         return {"ok": False,
-                "reason": "notional ${:.2f} below HL $10 minimum after leverage cap".format(
-                    notional)}
+                "reason": "notional ${:.2f} below HL min ${:.2f} after caps".format(
+                    notional, HL_MIN_NOTIONAL)}
 
-    # Verify leverage we're about to use
+    # Verify final leverage
     leverage_used = notional / equity if equity > 0 else 0
-    if leverage_used > max_leverage + 0.01:  # tolerance
+    if leverage_used > max_leverage + 0.01:
         return {"ok": False,
                 "reason": "leverage {:.2f}x > max {:.1f}x".format(
                     leverage_used, max_leverage)}
 
-    # Concurrent position cap
+    # Concurrent position cap (executor reads from bankroll state)
     open_positions = bankroll_state.get("open_positions", []) or []
     active = [p for p in open_positions if p.get("status") not in ("closed",)]
-    if len(active) >= EXECUTOR_MAX_OPEN_POSITIONS:
+    max_concurrent = int(bankroll_state.get("_max_concurrent_positions", 5))
+    if len(active) >= max_concurrent:
         return {"ok": False,
                 "reason": "{} active positions, cap is {}".format(
-                    len(active), EXECUTOR_MAX_OPEN_POSITIONS)}
+                    len(active), max_concurrent)}
 
-    # Compute size from notional and entry price
+    # Compute size
     raw_size = notional / limit_px
     size = _round_size(coin, raw_size)
     if size <= 0:
@@ -187,41 +134,32 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
                 "reason": "computed size {} <= 0 from notional ${:.2f} / px ${:.4f}".format(
                     size, notional, limit_px)}
 
-    # Direction flags for HL
+    # Direction flags
     entry_is_buy = (direction == "long")
-    exit_is_buy = (direction == "short")  # closing direction = opposite
+    exit_is_buy = (direction == "short")
 
-    # Generate stable cloids derived from signal_id so retry is idempotent
+    # Generate cloids derived from signal_id
     sig_hash = signal.signal_id.replace("-", "").replace("_", "")[:24].lower()
     sig_hash = "".join(c if c in "0123456789abcdef" else "0" for c in sig_hash)
     sig_hash = sig_hash.ljust(24, "0")
-    entry_cloid = "0x" + sig_hash + "0000000e"  # last 8 chars distinguish role
-    stop_cloid = "0x" + sig_hash + "0000000s"
-    # but cloid must be hex - replace non-hex
     entry_cloid = "0x" + (sig_hash + "00000000")[:32]
     stop_cloid = "0x" + (sig_hash + "11111111")[:32]
-    # validate hex
     try:
         int(entry_cloid, 16)
         int(stop_cloid, 16)
     except ValueError:
-        # fallback to random
         entry_cloid = "0x" + uuid.uuid4().hex
         stop_cloid = "0x" + uuid.uuid4().hex
 
-    # ---- Place ENTRY (limit, post-only) ----
+    # Place ENTRY (limit, post-only)
     print("[executor] placing ENTRY for " + signal.signal_id
           + " " + direction + " " + coin
-          + " size=" + str(size) + " limit=$" + str(limit_px))
+          + " size=" + str(size) + " limit=$" + str(limit_px)
+          + " notional=${:.2f} lev={:.2f}x".format(notional, leverage_used))
     try:
         entry_result = client.place_limit_order(
-            coin=coin,
-            is_buy=entry_is_buy,
-            sz=size,
-            limit_px=limit_px,
-            reduce_only=False,
-            cloid_str=entry_cloid,
-            post_only=True,
+            coin=coin, is_buy=entry_is_buy, sz=size, limit_px=limit_px,
+            reduce_only=False, cloid_str=entry_cloid, post_only=True,
         )
     except HLLimitExceeded as e:
         return {"ok": False, "reason": "entry rejected: " + str(e)}
@@ -234,29 +172,20 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
         return {"ok": False,
                 "reason": "entry failed: " + (err or str(entry_result)[:300])}
 
-    # ---- Place STOP (trigger market, reduce_only) ----
-    # NOTE: at this moment the position isn't open yet (entry is resting).
-    # We still place the stop now: HL accepts reduce_only triggers without
-    # an open position; the stop will only execute IF a position is open
-    # AND the trigger is hit. This avoids the race condition of placing the
-    # stop after entry fill.
+    # Place STOP (trigger market, reduce_only)
     print("[executor] placing STOP for " + signal.signal_id
           + " trigger=$" + str(stop_px))
     stop_oid = None
     try:
         stop_result = client.place_stop_market(
-            coin=coin,
-            is_buy=exit_is_buy,
-            sz=size,
-            trigger_px=stop_px,
-            cloid_str=stop_cloid,
+            coin=coin, is_buy=exit_is_buy, sz=size,
+            trigger_px=stop_px, cloid_str=stop_cloid,
         )
         stop_oid = _extract_oid(stop_result)
         if stop_oid is None:
             print("[executor] WARNING stop did not return oid: "
                   + str(stop_result)[:300])
     except Exception as e:
-        # If stop fails, we cancel the entry to keep the system consistent.
         print("[executor] stop failed, cancelling entry. err: " + str(e)[:200])
         try:
             client.cancel_order(coin, entry_oid)
@@ -274,10 +203,10 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
         "direction": direction,
         "size": size,
         "notional_usd": round(notional, 4),
-        "leverage_used": round(notional / equity, 4) if equity > 0 else 0,
+        "leverage_used": round(leverage_used, 4),
         "entry_oid": entry_oid,
         "stop_oid": stop_oid,
-        "target_oid": None,  # placed after entry fills
+        "target_oid": None,
         "limit_price": limit_px,
         "stop_price": stop_px,
         "target_price": target_px,
@@ -297,18 +226,7 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
 
 def reconcile_positions(client: HyperliquidClient,
                         bankroll_state: dict) -> list:
-    """Walk through open positions, transition their state, and return events.
-
-    Events returned (list of dicts):
-      [{"event": "entry_filled", "signal_id": ..., "fill_price": ...}, ...]
-      [{"event": "stop_filled", "signal_id": ..., "fill_price": ..., "pnl_usd": ...}, ...]
-      [{"event": "target_filled", ...}, ...]
-      [{"event": "entry_expired", ...}]   # cancelled after 8h
-      [{"event": "position_timeout", ...}] # market-closed after 48h
-
-    The bankroll_state is mutated in place: positions are updated, closed ones
-    moved out of open_positions, equity updated for closed PnL.
-    """
+    """Walk through open positions, transition state, return events."""
     events = []
     open_positions = bankroll_state.get("open_positions", []) or []
     if not open_positions:
@@ -316,7 +234,6 @@ def reconcile_positions(client: HyperliquidClient,
 
     now = datetime.now(timezone.utc)
 
-    # Get current open orders once
     try:
         open_orders = client.get_open_orders()
         open_oids = {o.get("oid") for o in open_orders}
@@ -324,7 +241,6 @@ def reconcile_positions(client: HyperliquidClient,
         print("[reconcile] could not fetch open_orders: " + str(e))
         open_oids = set()
 
-    # Get current positions on HL
     try:
         hl_positions = client.get_positions()
         hl_pos_by_coin = {p["coin"]: p for p in hl_positions}
@@ -344,13 +260,12 @@ def reconcile_positions(client: HyperliquidClient,
         except Exception:
             age_h = 0.0
 
-        # ---- Status: pending_entry ----
+        # Status: pending_entry
         if status == "pending_entry":
             entry_oid = pos.get("entry_oid")
             entry_still_open = entry_oid in open_oids
 
             if entry_still_open:
-                # Check if expired (validity 8h)
                 if age_h > ENTRY_VALIDITY_HOURS:
                     print("[reconcile] " + sig_id
                           + " entry expired (age={:.1f}h), cancelling".format(age_h))
@@ -358,7 +273,6 @@ def reconcile_positions(client: HyperliquidClient,
                         client.cancel_order(coin, entry_oid)
                     except Exception as e:
                         print("[reconcile] cancel entry failed: " + str(e))
-                    # Also cancel the stop (no longer needed)
                     if pos.get("stop_oid"):
                         try:
                             client.cancel_order(coin, pos["stop_oid"])
@@ -373,18 +287,14 @@ def reconcile_positions(client: HyperliquidClient,
                         "signal_id": sig_id,
                         "age_hours": round(age_h, 2),
                     })
-                    # don't add to new_open
                     continue
                 else:
-                    # Still pending and within validity
                     new_open.append(pos)
                     continue
             else:
-                # Entry no longer in open orders -> filled or cancelled externally
-                # Check HL position to know
+                # Entry no longer open -> filled or vanished
                 hl_pos = hl_pos_by_coin.get(coin)
                 if hl_pos and abs(hl_pos["size"]) >= pos["size"] * 0.95:
-                    # Entry filled
                     fill_px = hl_pos.get("entry_price", pos["limit_price"])
                     pos["status"] = "open"
                     pos["filled_at"] = now.isoformat()
@@ -395,7 +305,7 @@ def reconcile_positions(client: HyperliquidClient,
                         "fill_price": fill_px,
                     })
 
-                    # Now place the target
+                    # Place target
                     try:
                         exit_is_buy = (pos["direction"] == "short")
                         target_cloid = "0x" + uuid.uuid4().hex
@@ -411,15 +321,13 @@ def reconcile_positions(client: HyperliquidClient,
                               + " target placed oid=" + str(pos["target_oid"]))
                     except Exception as e:
                         print("[reconcile] target placement failed: " + str(e))
-                        # Position stays open without target; will timeout at 48h
                         pos["target_oid"] = None
 
                     new_open.append(pos)
                     continue
                 else:
-                    # Entry vanished but no position -> probably cancelled externally
                     print("[reconcile] " + sig_id
-                          + " entry oid gone but no position: probably cancelled")
+                          + " entry oid gone but no position: vanished")
                     pos["status"] = "expired"
                     pos["closed_at"] = now.isoformat()
                     pos["exit_reason"] = "entry_vanished"
@@ -430,7 +338,7 @@ def reconcile_positions(client: HyperliquidClient,
                     })
                     continue
 
-        # ---- Status: open ----
+        # Status: open
         if status == "open":
             hl_pos = hl_pos_by_coin.get(coin)
             stop_oid = pos.get("stop_oid")
@@ -440,24 +348,18 @@ def reconcile_positions(client: HyperliquidClient,
             target_still_open = target_oid in open_oids if target_oid else False
 
             if not hl_pos or abs(hl_pos.get("size", 0)) < 1e-9:
-                # Position closed -> determine reason
-                # If stop oid no longer open and was placed -> stop fired
-                # If target oid no longer open and was placed -> target hit
+                # Position closed
                 exit_reason = "unknown"
                 if target_oid and not target_still_open:
                     exit_reason = "target_hit"
                 elif stop_oid and not stop_still_open:
                     exit_reason = "stop_hit"
 
-                # Compute realized PnL using last known mark and entry
-                # Better: query HL trade history for accurate fill price.
-                # For now, approximate: target_hit -> use target_price, stop_hit -> stop_price
                 if exit_reason == "target_hit":
                     exit_px = pos["target_price"]
                 elif exit_reason == "stop_hit":
                     exit_px = pos["stop_price"]
                 else:
-                    # use last known mark
                     try:
                         exit_px = client.get_mark_price(coin)
                     except Exception:
@@ -468,12 +370,12 @@ def reconcile_positions(client: HyperliquidClient,
                 else:
                     pnl_per_unit = pos["limit_price"] - exit_px
                 pnl_usd = pnl_per_unit * pos["size"]
-                # Subtract estimated fees (entry maker + exit maker or taker)
-                entry_fee = pos["notional_usd"] * 0.000144  # maker
+                # Estimated fees
+                entry_fee = pos["notional_usd"] * 0.000144
                 if exit_reason == "stop_hit":
-                    exit_fee = pos["notional_usd"] * 0.000432  # taker
+                    exit_fee = pos["notional_usd"] * 0.000432
                 else:
-                    exit_fee = pos["notional_usd"] * 0.000144  # maker
+                    exit_fee = pos["notional_usd"] * 0.000144
                 pnl_usd -= (entry_fee + exit_fee)
 
                 pos["status"] = "closed"
@@ -514,7 +416,7 @@ def reconcile_positions(client: HyperliquidClient,
                 )
                 continue
 
-            # Position still open -> check for time-out
+            # Position still open -> check timeout
             try:
                 filled_dt = datetime.fromisoformat(pos["filled_at"])
                 hold_h = (now - filled_dt).total_seconds() / 3600.0
@@ -525,7 +427,6 @@ def reconcile_positions(client: HyperliquidClient,
                 print("[reconcile] " + sig_id
                       + " hold {:.1f}h > {}h, force-closing".format(
                           hold_h, POSITION_MAX_HOURS))
-                # Cancel target and stop
                 for oid_field in ["stop_oid", "target_oid"]:
                     other = pos.get(oid_field)
                     if other:
@@ -533,20 +434,18 @@ def reconcile_positions(client: HyperliquidClient,
                             client.cancel_order(coin, other)
                         except Exception:
                             pass
-                # Place a market close
                 exit_is_buy = (pos["direction"] == "short")
                 try:
                     mark = client.get_mark_price(coin)
-                    # market via aggressive limit
                     if exit_is_buy:
                         urgent_px = _round_price(coin, mark * 1.01)
                     else:
                         urgent_px = _round_price(coin, mark * 0.99)
-                    close_result = client.place_limit_order(
+                    client.place_limit_order(
                         coin=coin, is_buy=exit_is_buy, sz=pos["size"],
                         limit_px=urgent_px, reduce_only=True,
                         cloid_str="0x" + uuid.uuid4().hex,
-                        post_only=False,  # taker
+                        post_only=False,
                     )
                     pos["status"] = "closed"
                     pos["closed_at"] = now.isoformat()
@@ -575,14 +474,12 @@ def reconcile_positions(client: HyperliquidClient,
                     continue
                 except Exception as e:
                     print("[reconcile] force-close failed: " + str(e))
-                    # Keep open, retry next scan
                     new_open.append(pos)
                     continue
 
             new_open.append(pos)
             continue
 
-        # Other statuses -> drop
         if status not in ("closed", "expired"):
             new_open.append(pos)
 
@@ -591,7 +488,6 @@ def reconcile_positions(client: HyperliquidClient,
 
 
 def _extract_oid(result: dict) -> Optional[int]:
-    """Extract oid from HL order placement response."""
     try:
         if not isinstance(result, dict) or result.get("status") != "ok":
             return None
