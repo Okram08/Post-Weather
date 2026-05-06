@@ -1,18 +1,22 @@
-"""Live scanner with HL execution - runs every 4h.
+"""Unified scanner - runs every 30 min.
 
-Flow per scan:
-  1. Acquire scan lock (block reconciler during this run).
-  2. Load config + Gist state.
-  3. Init HL client.
-  4. Reconcile existing open positions on HL.
-  5. If halted -> heartbeat and exit.
-  6. For each pair: detect setup, gates, size, execute.
-  7. Persist state, log actions, send heartbeat.
-  8. Release lock.
+Behavior:
+  - ALWAYS reconciles open positions on HL (detect fills, place targets,
+    detect stop hits, force-close orphan positions).
+  - SCAN MODE: if a new 4h bar has closed since the last scan, do the full
+    scan of all 9 pairs and detect Setup A signals.
+  - LIGHT MODE: if no new 4h bar, only reconcile (silent unless events).
+
+Heartbeat policy:
+  - Always send heartbeat in SCAN MODE.
+  - Send mini heartbeat in LIGHT MODE only if events occurred.
+
+Lock: a single lock prevents overlapping runs (rare but possible if a run
+is slow and the next cron triggers too soon).
 """
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 
@@ -34,8 +38,9 @@ from src.executor import (
 
 
 LOCK_KEY = "lock.json"
-LOCK_TIMEOUT_MINUTES = 5
+LOCK_TIMEOUT_MINUTES = 8
 ACTIONS_LOG_KEY = "actions_log.json"
+SCAN_STATE_KEY = "last_scan_4h_bar.json"
 
 
 def _now_iso():
@@ -93,6 +98,48 @@ def _log_action(gist: GistState, action_type: str, detail: dict):
         print("[log] action log failed: " + str(e))
 
 
+def _last_4h_bar_close_iso():
+    """Return ISO timestamp of the most recent CLOSED 4h bar boundary.
+
+    4h bars close at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC.
+    Returns the most recent one strictly before now.
+    """
+    now = _now()
+    h = now.hour
+    last_close_h = (h // 4) * 4
+    last_close = now.replace(hour=last_close_h, minute=0, second=0, microsecond=0)
+    if last_close >= now:
+        last_close = last_close - timedelta(hours=4)
+    return last_close.isoformat()
+
+
+def _should_run_scan(gist: GistState) -> bool:
+    """Check if a new 4h bar has closed since the last scan."""
+    current_4h_close = _last_4h_bar_close_iso()
+    try:
+        state = gist.read(SCAN_STATE_KEY)
+        last_scanned = state.get("last_4h_bar", "") if state else ""
+    except Exception:
+        last_scanned = ""
+
+    if last_scanned == current_4h_close:
+        print("[scan_check] last 4h bar already scanned: " + current_4h_close)
+        return False
+    print("[scan_check] new 4h bar to scan: " + current_4h_close
+          + " (was: " + (last_scanned or "never") + ")")
+    return True
+
+
+def _mark_scan_done(gist: GistState):
+    try:
+        gist.write(SCAN_STATE_KEY, {
+            "last_4h_bar": _last_4h_bar_close_iso(),
+            "scanned_at": _now_iso(),
+        })
+    except Exception as e:
+        print("[scan_check] failed to persist: " + str(e))
+
+
 def _last_closed_4h_bar(ohlc_4h: pd.DataFrame):
     now = pd.Timestamp.now(tz="UTC")
     closed = ohlc_4h[ohlc_4h.index + pd.Timedelta(hours=4) <= now]
@@ -115,9 +162,38 @@ def _fmt_pct(x):
         return "n/a"
 
 
-def _format_heartbeat(bankroll, inspected, emitted_count, rejected_count,
-                      executed_count, reconcile_events, hl_connected):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def _format_event_message(ev: dict) -> str:
+    e_type = ev.get("event", "?")
+    sig_id = ev.get("signal_id", "?")
+    titles = {
+        "entry_filled": "*POSITION OPENED*",
+        "stop_hit": "*STOP HIT*",
+        "target_hit": "*TARGET HIT - WIN*",
+        "entry_expired": "*ENTRY EXPIRED (8h)*",
+        "entry_vanished": "*ENTRY VANISHED*",
+        "position_timeout": "*POSITION TIMEOUT (48h)*",
+        "stop_recovered": "*STOP RECOVERED*",
+        "stop_replaced_post_fill": "*STOP REPLACED post-fill*",
+        "naked_force_close": "*NAKED FORCE-CLOSE*",
+        "no_stop_safety_cancel": "*ENTRY CANCELLED (safety)*",
+    }
+    title = titles.get(e_type, "*EVENT: " + e_type + "*")
+    lines = [title, "Signal: `" + sig_id + "`"]
+    if "fill_price" in ev:
+        lines.append("Fill price: $" + str(ev["fill_price"]))
+    if "exit_price" in ev:
+        lines.append("Exit price: $" + str(ev["exit_price"]))
+    if "pnl_usd" in ev:
+        pnl = ev["pnl_usd"]
+        sign = "+" if pnl >= 0 else ""
+        lines.append("PnL: " + sign + "${:.2f}".format(pnl))
+    return "\n".join(lines)
+
+
+def _format_full_heartbeat(bankroll, inspected, emitted_count, rejected_count,
+                            executed_count, reconcile_events, hl_connected):
+    """Heartbeat for SCAN MODE (full report)."""
+    now_str = _now().strftime("%Y-%m-%d %H:%M UTC")
 
     def get(obj, key, default=None):
         if isinstance(obj, dict):
@@ -135,7 +211,7 @@ def _format_heartbeat(bankroll, inspected, emitted_count, rejected_count,
         dd_pct = (float(equity) - float(peak)) / float(peak)
 
     lines = [
-        "*Scan done* `" + now + "`",
+        "*Scan done* `" + now_str + "`",
         "",
         "*Bankroll:* " + _fmt_usd(equity)
             + " (peak " + _fmt_usd(peak) + ", DD " + _fmt_pct(dd_pct) + ")",
@@ -151,14 +227,10 @@ def _format_heartbeat(bankroll, inspected, emitted_count, rejected_count,
         lines.append("*Position events this scan:*")
         for ev in reconcile_events:
             tag = {
-                "entry_filled": "[FILL]",
-                "stop_hit": "[STOP]",
-                "target_hit": "[WIN]",
-                "entry_expired": "[CXL]",
-                "entry_vanished": "[CXL]",
-                "position_timeout": "[TIME]",
-                "stop_recovered": "[FIX]",
-                "naked_force_close": "[FORCE]",
+                "entry_filled": "[FILL]", "stop_hit": "[STOP]",
+                "target_hit": "[WIN]", "entry_expired": "[CXL]",
+                "entry_vanished": "[CXL]", "position_timeout": "[TIME]",
+                "stop_recovered": "[FIX]", "naked_force_close": "[FORCE]",
             }.get(ev.get("event", ""), "[?]")
             line = "  " + tag + " " + ev.get("signal_id", "?")
             if "pnl_usd" in ev:
@@ -196,55 +268,281 @@ def _format_heartbeat(bankroll, inspected, emitted_count, rejected_count,
     return "\n".join(lines)
 
 
-def _send_heartbeat(cfg, bankroll, inspected, emitted_count, rejected_count,
-                     executed_count, reconcile_events, hl_connected):
-    if not cfg.telegram.enabled:
-        return
-    try:
-        msg = _format_heartbeat(bankroll, inspected, emitted_count,
-                                 rejected_count, executed_count,
-                                 reconcile_events, hl_connected)
-        send_message(cfg.telegram.bot_token, cfg.telegram.chat_id, msg)
-    except Exception as e:
-        print("[heartbeat] failed: " + str(e))
-
-
-def _format_event_message(ev: dict) -> str:
-    e_type = ev.get("event", "?")
-    sig_id = ev.get("signal_id", "?")
-    titles = {
-        "entry_filled": "*POSITION OPENED*",
-        "stop_hit": "*STOP HIT*",
-        "target_hit": "*TARGET HIT - WIN*",
-        "entry_expired": "*ENTRY EXPIRED (8h)*",
-        "entry_vanished": "*ENTRY VANISHED*",
-        "position_timeout": "*POSITION TIMEOUT (48h)*",
-        "stop_recovered": "*STOP RECOVERED*",
-        "stop_replaced_post_fill": "*STOP REPLACED post-fill*",
-        "naked_force_close": "*NAKED FORCE-CLOSE*",
-        "no_stop_safety_cancel": "*ENTRY CANCELLED (safety)*",
-    }
-    title = titles.get(e_type, "*EVENT: " + e_type + "*")
-    lines = [title, "Signal: `" + sig_id + "`"]
-    if "fill_price" in ev:
-        lines.append("Fill price: $" + str(ev["fill_price"]))
-    if "exit_price" in ev:
-        lines.append("Exit price: $" + str(ev["exit_price"]))
-    if "pnl_usd" in ev:
-        pnl = ev["pnl_usd"]
-        sign = "+" if pnl >= 0 else ""
-        lines.append("PnL: " + sign + "${:.2f}".format(pnl))
+def _format_light_heartbeat(bankroll_state, reconcile_events):
+    """Compact mini-heartbeat for LIGHT MODE - only sent if events."""
+    now_str = _now().strftime("%H:%M UTC")
+    open_positions = bankroll_state.get("open_positions", []) or []
+    equity = bankroll_state.get("equity_usd", 0.0)
+    lines = [
+        "*Reconcile* `" + now_str + "`",
+        str(len(reconcile_events)) + " event(s) processed",
+        "Equity: ${:.2f}".format(equity),
+        "Open positions: " + str(len(open_positions)),
+    ]
     return "\n".join(lines)
 
 
-def run() -> int:
+def _do_reconcile(hl_client, bankroll_dict, gist, cfg):
+    """Run reconcile and return events."""
+    if not bankroll_dict.get("open_positions"):
+        return []
+    n = len(bankroll_dict["open_positions"])
+    print("[reconcile] " + str(n) + " positions to check")
+    try:
+        events = reconcile_positions(hl_client, bankroll_dict)
+    except Exception as e:
+        print("[reconcile] crashed: " + str(e))
+        traceback.print_exc()
+        _log_action(gist, "reconcile_error", {"error": str(e)[:200]})
+        return []
+    for ev in events:
+        print("[reconcile] event: " + str(ev))
+        _log_action(gist, "event", ev)
+        if cfg.telegram.enabled:
+            try:
+                send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
+                             _format_event_message(ev))
+            except Exception:
+                pass
+    return events
+
+
+def _do_full_scan(hl_client, bankroll, bankroll_dict, is_dataclass,
+                   cfg, gist, reconcile_events):
+    """Run the full scan of all pairs, place orders, send heartbeat."""
     inspected = []
     n_emitted = 0
     n_rejected = 0
     n_executed = 0
-    reconcile_events = []
-    hl_connected = False
 
+    if bankroll_dict.get("halted"):
+        if cfg.telegram.enabled:
+            send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
+                         format_halt(bankroll_dict.get("halt_reason", "")))
+        for pair in cfg.strategy.pairs:
+            inspected.append({"pair": pair, "status": "halted",
+                              "detail": "halted"})
+        _log_action(gist, "scan_run", {
+            "halted": True, "n_pairs": len(cfg.strategy.pairs),
+            "n_signals": 0, "n_executed": 0,
+            "n_events": len(reconcile_events),
+        })
+        msg = _format_full_heartbeat(bankroll, inspected, 0, 0, 0,
+                                      reconcile_events, hl_client is not None)
+        if cfg.telegram.enabled:
+            send_message(cfg.telegram.bot_token, cfg.telegram.chat_id, msg)
+        return inspected, n_emitted, n_rejected, n_executed
+
+    emitted = set(gist.read("emitted_signals.json").get("ids", []))
+    exchange = make_exchange(cfg.frictions.exchange)
+
+    bankroll_params = {
+        "risk_per_trade_pct": cfg.bankroll.risk_per_trade_pct,
+        "max_concurrent_positions": cfg.bankroll.max_concurrent_positions,
+        "max_leverage": cfg.bankroll.max_leverage,
+        "daily_loss_limit_pct": cfg.bankroll.daily_loss_limit_pct,
+        "max_drawdown_pct": cfg.bankroll.max_drawdown_pct,
+        "sizing_model": cfg.bankroll.sizing_model,
+        "kelly_fraction": cfg.bankroll.kelly_fraction,
+    }
+
+    for pair in cfg.strategy.pairs:
+        try:
+            ohlc_1h = fetch_ohlcv_recent(exchange, pair, "1h", n_bars=300)
+            if ohlc_1h.empty or len(ohlc_1h) < 100:
+                inspected.append({"pair": pair, "status": "no-data",
+                                  "detail": "<100 1h bars"})
+                continue
+
+            ohlc_4h = compute_indicators(resample_to_4h(ohlc_1h))
+            if len(ohlc_4h) < 30:
+                inspected.append({"pair": pair, "status": "no-data",
+                                  "detail": "<30 4h bars"})
+                continue
+
+            funding = fetch_current_funding(exchange, pair)
+            ohlc_4h = ohlc_4h.copy()
+            ohlc_4h["funding_rate"] = funding
+
+            last_bar = _last_closed_4h_bar(ohlc_4h)
+            if last_bar is None:
+                inspected.append({"pair": pair, "status": "no-data",
+                                  "detail": "no closed 4h bar"})
+                continue
+
+            current_price = float(ohlc_1h["close"].iloc[-1])
+            signal = detect_setup_a(last_bar, pair, current_price,
+                                    cfg.strategy.setup_a)
+
+            ext = float(last_bar.get("extension_atr", float("nan")))
+            rsi = float(last_bar.get("rsi", float("nan")))
+            adx = float(last_bar.get("adx", float("nan")))
+            fund = float(last_bar.get("funding_rate", 0.0))
+            ind_detail = "ext={:.2f} rsi={:.1f} adx={:.1f} fund={:.6f}".format(
+                ext, rsi, adx, fund)
+
+            if signal is None:
+                inspected.append({"pair": pair, "status": "no-setup",
+                                  "detail": ind_detail})
+                continue
+
+            direction = getattr(signal, "direction", "long")
+            sig_id = getattr(signal, "signal_id", "")
+
+            if sig_id in emitted:
+                inspected.append({"pair": pair,
+                                  "status": "setup-" + direction,
+                                  "detail": "duplicate " + sig_id})
+                continue
+
+            sizing = compute_size(bankroll, signal, bankroll_params)
+            if not sizing.accept:
+                msg = format_rejected(signal, sizing)
+                if cfg.telegram.enabled:
+                    send_message(cfg.telegram.bot_token,
+                                 cfg.telegram.chat_id, msg)
+                print("[" + pair + "] REJECTED " + sig_id
+                      + ": " + str(sizing.reason))
+                n_rejected += 1
+                emitted.add(sig_id)
+                inspected.append({
+                    "pair": pair, "status": "setup-" + direction,
+                    "detail": "REJECTED: " + str(sizing.reason),
+                })
+                _log_action(gist, "signal_rejected", {
+                    "id": sig_id, "pair": pair, "reason": sizing.reason,
+                })
+                gist.append_log("signals_log.json", {
+                    "id": sig_id, "pair": pair, "direction": direction,
+                    "status": "rejected", "reason": sizing.reason,
+                })
+                continue
+
+            msg = format_signal(signal, sizing, bankroll)
+            if cfg.telegram.enabled:
+                send_message(cfg.telegram.bot_token,
+                             cfg.telegram.chat_id, msg)
+            n_emitted += 1
+            emitted.add(sig_id)
+            _log_action(gist, "signal_emitted", {
+                "id": sig_id, "pair": pair, "direction": direction,
+            })
+
+            if hl_client is None:
+                inspected.append({"pair": pair,
+                                  "status": "setup-" + direction,
+                                  "detail": "EMITTED " + sig_id + " (PAPER)"})
+                gist.append_log("signals_log.json", {
+                    "id": sig_id, "pair": pair, "direction": direction,
+                    "status": "emitted_paper",
+                })
+                print("[" + pair + "] EMITTED PAPER " + sig_id)
+            else:
+                exec_result = execute_signal(hl_client, signal, sizing,
+                                              bankroll_dict)
+                if exec_result["ok"]:
+                    n_executed += 1
+                    bankroll_dict["open_positions"].append(
+                        exec_result["position"])
+                    if is_dataclass:
+                        bankroll.open_positions = bankroll_dict["open_positions"]
+                    pos = exec_result["position"]
+                    inspected.append({
+                        "pair": pair, "status": "setup-" + direction,
+                        "detail": "EXECUTED notional=${:.2f}".format(
+                            pos.get("notional_usd", 0)),
+                    })
+                    _log_action(gist, "order_executed", {
+                        "id": sig_id, "pair": pair,
+                        "entry_oid": pos["entry_oid"],
+                        "stop_oid": pos["stop_oid"],
+                        "notional": pos.get("notional_usd"),
+                    })
+                    gist.append_log("signals_log.json", {
+                        "id": sig_id, "pair": pair, "direction": direction,
+                        "status": "executed",
+                        "entry_oid": pos["entry_oid"],
+                        "stop_oid": pos["stop_oid"],
+                        "limit": pos["limit_price"],
+                        "stop": pos["stop_price"],
+                        "target": pos["target_price"],
+                        "size": pos["size"],
+                        "notional_usd": pos.get("notional_usd"),
+                    })
+                    if cfg.telegram.enabled:
+                        send_message(
+                            cfg.telegram.bot_token,
+                            cfg.telegram.chat_id,
+                            "*EXECUTED* `" + sig_id + "`\n"
+                            + "notional=$" + "{:.2f}".format(
+                                pos.get("notional_usd", 0))
+                            + "\nentry oid=`" + str(pos["entry_oid"])
+                            + "`\nstop oid=`" + str(pos["stop_oid"]) + "`"
+                        )
+                    print("[" + pair + "] EXECUTED " + sig_id)
+                else:
+                    inspected.append({
+                        "pair": pair, "status": "setup-" + direction,
+                        "detail": "EXEC FAILED: "
+                                  + exec_result["reason"][:80],
+                    })
+                    _log_action(gist, "exec_failed", {
+                        "id": sig_id, "pair": pair,
+                        "reason": exec_result["reason"][:200],
+                    })
+                    gist.append_log("signals_log.json", {
+                        "id": sig_id, "pair": pair, "direction": direction,
+                        "status": "exec_failed",
+                        "reason": exec_result["reason"],
+                    })
+                    if cfg.telegram.enabled:
+                        send_message(
+                            cfg.telegram.bot_token,
+                            cfg.telegram.chat_id,
+                            "*EXEC FAILED* `" + sig_id + "`\nreason: `"
+                            + exec_result["reason"][:200] + "`"
+                        )
+                    print("[" + pair + "] EXEC FAILED")
+
+        except Exception as e:
+            err = type(e).__name__ + ": " + str(e)
+            print("[" + pair + "] error: " + err)
+            traceback.print_exc()
+            inspected.append({"pair": pair, "status": "error",
+                              "detail": err[:80]})
+            _log_action(gist, "scan_pair_error", {
+                "pair": pair, "error": err[:200],
+            })
+            if cfg.telegram.enabled:
+                send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
+                             format_error(pair, err))
+
+    if is_dataclass:
+        bankroll.open_positions = bankroll_dict["open_positions"]
+
+    _log_action(gist, "scan_run", {
+        "n_pairs": len(cfg.strategy.pairs),
+        "n_signals": n_emitted,
+        "n_rejected": n_rejected,
+        "n_executed": n_executed,
+        "n_events": len(reconcile_events),
+    })
+
+    try:
+        gist.write("emitted_signals.json", {"ids": list(emitted)[-500:]})
+    except Exception as e:
+        print("[fatal] cannot persist emitted: " + str(e))
+
+    msg = _format_full_heartbeat(bankroll, inspected, n_emitted, n_rejected,
+                                  n_executed, reconcile_events,
+                                  hl_client is not None)
+    if cfg.telegram.enabled:
+        send_message(cfg.telegram.bot_token, cfg.telegram.chat_id, msg)
+
+    return inspected, n_emitted, n_rejected, n_executed
+
+
+def run() -> int:
     try:
         cfg = load_config()
     except Exception as e:
@@ -257,27 +555,25 @@ def run() -> int:
 
     gist = GistState(cfg.gist.pat, cfg.gist.state_gist_id)
 
-    # Acquire lock
     if not _try_acquire_lock(gist, "scanner"):
         _log_action(gist, "scan_skipped", {"reason": "lock held"})
-        print("[scanner] skipped (lock held)")
         return 0
 
     try:
+        # Determine mode
+        scan_mode = _should_run_scan(gist)
+
         # Load bankroll
         try:
             bankroll = load_bankroll(gist, {
                 "initial_capital_usd": cfg.bankroll.initial_capital_usd
             })
         except Exception as e:
-            print("[fatal] cannot load bankroll: " + str(e))
+            print("[fatal] bankroll load: " + str(e))
             _log_action(gist, "scan_error", {"error": str(e)[:200]})
-            if cfg.telegram.enabled:
-                send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
-                             "Cannot load bankroll: `" + str(e) + "`")
             return 1
 
-        # Convert to dict
+        # To dict
         if hasattr(bankroll, "__dict__"):
             bankroll_dict = {
                 "equity_usd": getattr(bankroll, "equity_usd",
@@ -299,34 +595,19 @@ def run() -> int:
         bankroll_dict["_max_concurrent_positions"] = int(
             cfg.bankroll.max_concurrent_positions)
 
-        # Init HL
         hl_client = make_client_from_env()
-        hl_connected = hl_client is not None
-        if hl_connected:
-            print("[scanner] LIVE EXECUTION")
-            print("[scanner] equity=${:.2f}, max_leverage={:.1f}x".format(
-                bankroll_dict["equity_usd"], bankroll_dict["_max_leverage"]))
+        if hl_client:
+            print("[run] LIVE EXECUTION mode")
         else:
-            print("[scanner] PAPER mode")
+            print("[run] PAPER mode")
 
-        # Reconcile open positions
+        # ALWAYS reconcile first
+        reconcile_events = []
         if hl_client and bankroll_dict.get("open_positions"):
-            try:
-                reconcile_events = reconcile_positions(hl_client, bankroll_dict)
-                for ev in reconcile_events:
-                    print("[reconcile] " + str(ev))
-                    _log_action(gist, "event", ev)
-                    if cfg.telegram.enabled:
-                        try:
-                            send_message(cfg.telegram.bot_token,
-                                         cfg.telegram.chat_id,
-                                         _format_event_message(ev))
-                        except Exception:
-                            pass
-            except Exception as e:
-                print("[scanner] reconcile failed: " + str(e))
-                traceback.print_exc()
+            reconcile_events = _do_reconcile(hl_client, bankroll_dict,
+                                              gist, cfg)
 
+        # Sync back to dataclass
         if is_dataclass:
             bankroll.equity_usd = bankroll_dict["equity_usd"]
             bankroll.peak_equity_usd = bankroll_dict["peak_equity_usd"]
@@ -335,245 +616,47 @@ def run() -> int:
             bankroll.halt_reason = bankroll_dict["halt_reason"]
             bankroll.open_positions = bankroll_dict["open_positions"]
 
-        # Halted check
-        if bankroll_dict.get("halted"):
-            if cfg.telegram.enabled:
-                send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
-                             format_halt(bankroll_dict.get("halt_reason", "")))
-            for pair in cfg.strategy.pairs:
-                inspected.append({"pair": pair, "status": "halted",
-                                  "detail": "halted"})
-            save_bankroll(gist, bankroll)
-            _log_action(gist, "scan_run", {
-                "halted": True, "n_pairs": len(cfg.strategy.pairs),
-                "n_signals": 0, "n_executed": 0, "n_events": len(reconcile_events),
+        # Run full scan if needed
+        if scan_mode:
+            print("[run] SCAN MODE (new 4h bar)")
+            _log_action(gist, "scan_mode", {"mode": "full"})
+            inspected, n_emitted, n_rejected, n_executed = _do_full_scan(
+                hl_client, bankroll, bankroll_dict, is_dataclass,
+                cfg, gist, reconcile_events)
+            _mark_scan_done(gist)
+        else:
+            print("[run] LIGHT MODE (no new 4h bar, reconcile only)")
+            _log_action(gist, "reconcile_only", {
+                "n_events": len(reconcile_events),
             })
-            _send_heartbeat(cfg, bankroll, inspected, 0, 0, 0,
-                            reconcile_events, hl_connected)
-            return 0
-
-        emitted = set(gist.read("emitted_signals.json").get("ids", []))
-        exchange = make_exchange(cfg.frictions.exchange)
-
-        bankroll_params = {
-            "risk_per_trade_pct": cfg.bankroll.risk_per_trade_pct,
-            "max_concurrent_positions": cfg.bankroll.max_concurrent_positions,
-            "max_leverage": cfg.bankroll.max_leverage,
-            "daily_loss_limit_pct": cfg.bankroll.daily_loss_limit_pct,
-            "max_drawdown_pct": cfg.bankroll.max_drawdown_pct,
-            "sizing_model": cfg.bankroll.sizing_model,
-            "kelly_fraction": cfg.bankroll.kelly_fraction,
-        }
-
-        # Scan each pair
-        for pair in cfg.strategy.pairs:
-            try:
-                ohlc_1h = fetch_ohlcv_recent(exchange, pair, "1h", n_bars=300)
-                if ohlc_1h.empty or len(ohlc_1h) < 100:
-                    inspected.append({"pair": pair, "status": "no-data",
-                                      "detail": "<100 1h bars"})
-                    continue
-
-                ohlc_4h = compute_indicators(resample_to_4h(ohlc_1h))
-                if len(ohlc_4h) < 30:
-                    inspected.append({"pair": pair, "status": "no-data",
-                                      "detail": "<30 4h bars"})
-                    continue
-
-                funding = fetch_current_funding(exchange, pair)
-                ohlc_4h = ohlc_4h.copy()
-                ohlc_4h["funding_rate"] = funding
-
-                last_bar = _last_closed_4h_bar(ohlc_4h)
-                if last_bar is None:
-                    inspected.append({"pair": pair, "status": "no-data",
-                                      "detail": "no closed 4h bar"})
-                    continue
-
-                current_price = float(ohlc_1h["close"].iloc[-1])
-                signal = detect_setup_a(last_bar, pair, current_price,
-                                        cfg.strategy.setup_a)
-
-                ext = float(last_bar.get("extension_atr", float("nan")))
-                rsi = float(last_bar.get("rsi", float("nan")))
-                adx = float(last_bar.get("adx", float("nan")))
-                fund = float(last_bar.get("funding_rate", 0.0))
-                ind_detail = "ext={:.2f} rsi={:.1f} adx={:.1f} fund={:.6f}".format(
-                    ext, rsi, adx, fund)
-
-                if signal is None:
-                    inspected.append({"pair": pair, "status": "no-setup",
-                                      "detail": ind_detail})
-                    continue
-
-                direction = getattr(signal, "direction", "long")
-                sig_id = getattr(signal, "signal_id", "")
-
-                if sig_id in emitted:
-                    inspected.append({"pair": pair,
-                                      "status": "setup-" + direction,
-                                      "detail": "duplicate " + sig_id})
-                    continue
-
-                sizing = compute_size(bankroll, signal, bankroll_params)
-                if not sizing.accept:
-                    msg = format_rejected(signal, sizing)
-                    if cfg.telegram.enabled:
-                        send_message(cfg.telegram.bot_token,
-                                     cfg.telegram.chat_id, msg)
-                    print("[" + pair + "] REJECTED " + sig_id
-                          + ": " + str(sizing.reason))
-                    n_rejected += 1
-                    emitted.add(sig_id)
-                    inspected.append({
-                        "pair": pair, "status": "setup-" + direction,
-                        "detail": "REJECTED: " + str(sizing.reason),
-                    })
-                    _log_action(gist, "signal_rejected", {
-                        "id": sig_id, "pair": pair, "reason": sizing.reason,
-                    })
-                    gist.append_log("signals_log.json", {
-                        "id": sig_id, "pair": pair, "direction": direction,
-                        "status": "rejected", "reason": sizing.reason,
-                    })
-                    continue
-
-                msg = format_signal(signal, sizing, bankroll)
-                if cfg.telegram.enabled:
+            # Light heartbeat only if events
+            if reconcile_events and cfg.telegram.enabled:
+                try:
+                    msg = _format_light_heartbeat(bankroll_dict,
+                                                   reconcile_events)
                     send_message(cfg.telegram.bot_token,
                                  cfg.telegram.chat_id, msg)
-                n_emitted += 1
-                emitted.add(sig_id)
-                _log_action(gist, "signal_emitted", {
-                    "id": sig_id, "pair": pair, "direction": direction,
-                })
+                except Exception as e:
+                    print("[run] light heartbeat failed: " + str(e))
 
-                if hl_client is None:
-                    inspected.append({"pair": pair,
-                                      "status": "setup-" + direction,
-                                      "detail": "EMITTED " + sig_id + " (PAPER)"})
-                    gist.append_log("signals_log.json", {
-                        "id": sig_id, "pair": pair, "direction": direction,
-                        "status": "emitted_paper",
-                    })
-                    print("[" + pair + "] EMITTED PAPER " + sig_id)
-                else:
-                    exec_result = execute_signal(hl_client, signal, sizing,
-                                                  bankroll_dict)
-                    if exec_result["ok"]:
-                        n_executed += 1
-                        bankroll_dict["open_positions"].append(
-                            exec_result["position"])
-                        if is_dataclass:
-                            bankroll.open_positions = bankroll_dict["open_positions"]
-                        pos = exec_result["position"]
-                        inspected.append({
-                            "pair": pair, "status": "setup-" + direction,
-                            "detail": "EXECUTED notional=${:.2f}".format(
-                                pos.get("notional_usd", 0)),
-                        })
-                        _log_action(gist, "order_executed", {
-                            "id": sig_id, "pair": pair,
-                            "entry_oid": pos["entry_oid"],
-                            "stop_oid": pos["stop_oid"],
-                            "notional": pos.get("notional_usd"),
-                            "leverage": pos.get("leverage_used"),
-                        })
-                        gist.append_log("signals_log.json", {
-                            "id": sig_id, "pair": pair, "direction": direction,
-                            "status": "executed",
-                            "entry_oid": pos["entry_oid"],
-                            "stop_oid": pos["stop_oid"],
-                            "limit": pos["limit_price"],
-                            "stop": pos["stop_price"],
-                            "target": pos["target_price"],
-                            "size": pos["size"],
-                            "notional_usd": pos.get("notional_usd"),
-                        })
-                        if cfg.telegram.enabled:
-                            send_message(
-                                cfg.telegram.bot_token,
-                                cfg.telegram.chat_id,
-                                "*EXECUTED* `" + sig_id + "`\n"
-                                + "notional=$" + "{:.2f}".format(
-                                    pos.get("notional_usd", 0))
-                                + "\nentry oid=`" + str(pos["entry_oid"])
-                                + "`\nstop oid=`" + str(pos["stop_oid"]) + "`"
-                            )
-                        print("[" + pair + "] EXECUTED " + sig_id)
-                    else:
-                        inspected.append({
-                            "pair": pair, "status": "setup-" + direction,
-                            "detail": "EXEC FAILED: " + exec_result["reason"][:80],
-                        })
-                        _log_action(gist, "exec_failed", {
-                            "id": sig_id, "pair": pair,
-                            "reason": exec_result["reason"][:200],
-                        })
-                        gist.append_log("signals_log.json", {
-                            "id": sig_id, "pair": pair, "direction": direction,
-                            "status": "exec_failed",
-                            "reason": exec_result["reason"],
-                        })
-                        if cfg.telegram.enabled:
-                            send_message(
-                                cfg.telegram.bot_token,
-                                cfg.telegram.chat_id,
-                                "*EXEC FAILED* `" + sig_id + "`\nreason: `"
-                                + exec_result["reason"][:200] + "`"
-                            )
-                        print("[" + pair + "] EXEC FAILED")
-
-            except Exception as e:
-                err = type(e).__name__ + ": " + str(e)
-                print("[" + pair + "] error: " + err)
-                traceback.print_exc()
-                inspected.append({"pair": pair, "status": "error",
-                                  "detail": err[:80]})
-                _log_action(gist, "scan_pair_error", {
-                    "pair": pair, "error": err[:200],
-                })
-                if cfg.telegram.enabled:
-                    send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
-                                 format_error(pair, err))
-
+        # Sync final and persist
         if is_dataclass:
             bankroll.equity_usd = bankroll_dict["equity_usd"]
             bankroll.peak_equity_usd = bankroll_dict["peak_equity_usd"]
             bankroll.daily_pnl_usd = bankroll_dict["daily_pnl_usd"]
             bankroll.open_positions = bankroll_dict["open_positions"]
 
-        # Log this scan run summary
-        _log_action(gist, "scan_run", {
-            "n_pairs": len(cfg.strategy.pairs),
-            "n_signals": n_emitted,
-            "n_rejected": n_rejected,
-            "n_executed": n_executed,
-            "n_events": len(reconcile_events),
-        })
-
         try:
-            gist.write("emitted_signals.json", {"ids": list(emitted)[-500:]})
             save_bankroll(gist, bankroll)
         except Exception as e:
-            print("[fatal] cannot persist: " + str(e))
+            print("[fatal] persist failed: " + str(e))
             _log_action(gist, "scan_error", {
                 "error": "persist: " + str(e)[:200],
             })
-            if cfg.telegram.enabled:
-                send_message(cfg.telegram.bot_token, cfg.telegram.chat_id,
-                             "Cannot persist: `" + str(e) + "`")
-            _send_heartbeat(cfg, bankroll, inspected, n_emitted, n_rejected,
-                            n_executed, reconcile_events, hl_connected)
             return 1
 
-        _send_heartbeat(cfg, bankroll, inspected, n_emitted, n_rejected,
-                        n_executed, reconcile_events, hl_connected)
-
-        print("\nDone. Emitted: " + str(n_emitted)
-              + ", Rejected: " + str(n_rejected)
-              + ", Executed: " + str(n_executed)
-              + ", Reconcile: " + str(len(reconcile_events)))
+        print("[run] done. mode=" + ("scan" if scan_mode else "light")
+              + ", events=" + str(len(reconcile_events)))
         return 0
     finally:
         _release_lock(gist)
