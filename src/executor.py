@@ -28,12 +28,16 @@ from typing import Optional
 from src.hyperliquid_client import HyperliquidClient, HLLimitExceeded
 
 
-# ===== HARD LIMITS (bot-level safety on top of HL client limits) =====
-EXECUTOR_MAX_NOTIONAL_PER_TRADE = 100.0  # USD per single position
+# ===== EXECUTOR LIMITS =====
+# Notional cap is DYNAMIC: bankroll * max_leverage_from_config (3x by default).
+# This guarantees leverage never exceeds the configured max.
+# Hard upper bound is enforced by hyperliquid_client.py at $200 anyway.
 EXECUTOR_MAX_OPEN_POSITIONS = 1
 ENTRY_VALIDITY_HOURS = 8
 POSITION_MAX_HOURS = 48
-# =====================================================================
+# An absolute floor: never let a single trade exceed this even if config drifts
+EXECUTOR_HARD_NOTIONAL_CEILING = 500.0
+# ============================
 
 
 def pair_to_coin(pair: str) -> str:
@@ -139,12 +143,33 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
     else:
         return {"ok": False, "reason": "unknown direction: " + str(direction)}
 
-    # Notional check (executor-level, in addition to client-level)
+    # Notional cap = DYNAMIC based on bankroll * max_leverage (typically 3x).
+    # This is THE safety: leverage is mathematically capped here.
     notional = float(sizing.notional_usd)
-    if notional > EXECUTOR_MAX_NOTIONAL_PER_TRADE:
+    equity = float(bankroll_state.get("equity_usd", 0.0))
+    max_leverage = float(bankroll_state.get("_max_leverage", 3.0))
+    dynamic_cap = equity * max_leverage
+    effective_cap = min(dynamic_cap, EXECUTOR_HARD_NOTIONAL_CEILING)
+
+    if notional > effective_cap:
+        # Clamp the notional down rather than reject (we honor the leverage cap)
+        clamped_notional = effective_cap
+        print("[executor] notional ${:.2f} would exceed leverage cap "
+              "(equity=${:.2f} * {:.1f}x = ${:.2f}), clamping to ${:.2f}".format(
+                  notional, equity, max_leverage, dynamic_cap, clamped_notional))
+        notional = clamped_notional
+
+    if notional < 10.0:  # HL minimum
         return {"ok": False,
-                "reason": "notional ${:.2f} > executor cap ${:.2f}".format(
-                    notional, EXECUTOR_MAX_NOTIONAL_PER_TRADE)}
+                "reason": "notional ${:.2f} below HL $10 minimum after leverage cap".format(
+                    notional)}
+
+    # Verify leverage we're about to use
+    leverage_used = notional / equity if equity > 0 else 0
+    if leverage_used > max_leverage + 0.01:  # tolerance
+        return {"ok": False,
+                "reason": "leverage {:.2f}x > max {:.1f}x".format(
+                    leverage_used, max_leverage)}
 
     # Concurrent position cap
     open_positions = bankroll_state.get("open_positions", []) or []
@@ -249,6 +274,7 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
         "direction": direction,
         "size": size,
         "notional_usd": round(notional, 4),
+        "leverage_used": round(notional / equity, 4) if equity > 0 else 0,
         "entry_oid": entry_oid,
         "stop_oid": stop_oid,
         "target_oid": None,  # placed after entry fills
