@@ -1,21 +1,20 @@
-"""Unified scanner - runs every 30 min.
+"""Unified scanner with BRACKET ORDERS - runs every 30 min.
+
+KEY CHANGE FROM v4:
+  Now uses HL native bracket orders (entry + SL + TP placed atomically).
+  - TP is armed INSTANTLY when entry fills - no more 30min delay.
+  - Cancelling entry auto-cancels SL/TP (HL handles linkage).
+  - Reconcile is now simpler: just detects state transitions, no manual TP placement.
 
 Behavior:
-  - ALWAYS reconciles open positions on HL (detect fills, place targets,
-    detect stop hits, force-close orphan positions).
+  - ALWAYS reconciles open positions on HL.
   - SCAN MODE: if a new 4h bar has closed since the last scan, do the full
     scan of all 9 pairs and detect Setup A signals.
   - LIGHT MODE: if no new 4h bar, only reconcile (silent unless events).
-
-Heartbeat policy:
-  - Always send heartbeat in SCAN MODE.
-  - Send mini heartbeat in LIGHT MODE only if events occurred.
-
-Lock: a single lock prevents overlapping runs (rare but possible if a run
-is slow and the next cron triggers too soon).
 """
 import sys
 import traceback
+import uuid
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -99,11 +98,7 @@ def _log_action(gist: GistState, action_type: str, detail: dict):
 
 
 def _last_4h_bar_close_iso():
-    """Return ISO timestamp of the most recent CLOSED 4h bar boundary.
-
-    4h bars close at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC.
-    Returns the most recent one strictly before now.
-    """
+    """ISO timestamp of the most recent CLOSED 4h bar boundary."""
     now = _now()
     h = now.hour
     last_close_h = (h // 4) * 4
@@ -114,7 +109,6 @@ def _last_4h_bar_close_iso():
 
 
 def _should_run_scan(gist: GistState) -> bool:
-    """Check if a new 4h bar has closed since the last scan."""
     current_4h_close = _last_4h_bar_close_iso()
     try:
         state = gist.read(SCAN_STATE_KEY)
@@ -192,7 +186,6 @@ def _format_event_message(ev: dict) -> str:
 
 def _format_full_heartbeat(bankroll, inspected, emitted_count, rejected_count,
                             executed_count, reconcile_events, hl_connected):
-    """Heartbeat for SCAN MODE (full report)."""
     now_str = _now().strftime("%Y-%m-%d %H:%M UTC")
 
     def get(obj, key, default=None):
@@ -269,7 +262,6 @@ def _format_full_heartbeat(bankroll, inspected, emitted_count, rejected_count,
 
 
 def _format_light_heartbeat(bankroll_state, reconcile_events):
-    """Compact mini-heartbeat for LIGHT MODE - only sent if events."""
     now_str = _now().strftime("%H:%M UTC")
     open_positions = bankroll_state.get("open_positions", []) or []
     equity = bankroll_state.get("equity_usd", 0.0)
@@ -283,7 +275,6 @@ def _format_light_heartbeat(bankroll_state, reconcile_events):
 
 
 def _do_reconcile(hl_client, bankroll_dict, gist, cfg):
-    """Run reconcile and return events."""
     if not bankroll_dict.get("open_positions"):
         return []
     n = len(bankroll_dict["open_positions"])
@@ -309,7 +300,6 @@ def _do_reconcile(hl_client, bankroll_dict, gist, cfg):
 
 def _do_full_scan(hl_client, bankroll, bankroll_dict, is_dataclass,
                    cfg, gist, reconcile_events):
-    """Run the full scan of all pairs, place orders, send heartbeat."""
     inspected = []
     n_emitted = 0
     n_rejected = 0
@@ -456,6 +446,7 @@ def _do_full_scan(hl_client, bankroll, bankroll_dict, is_dataclass,
                         "id": sig_id, "pair": pair,
                         "entry_oid": pos["entry_oid"],
                         "stop_oid": pos["stop_oid"],
+                        "target_oid": pos.get("target_oid"),
                         "notional": pos.get("notional_usd"),
                     })
                     gist.append_log("signals_log.json", {
@@ -463,6 +454,7 @@ def _do_full_scan(hl_client, bankroll, bankroll_dict, is_dataclass,
                         "status": "executed",
                         "entry_oid": pos["entry_oid"],
                         "stop_oid": pos["stop_oid"],
+                        "target_oid": pos.get("target_oid"),
                         "limit": pos["limit_price"],
                         "stop": pos["stop_price"],
                         "target": pos["target_price"],
@@ -473,11 +465,12 @@ def _do_full_scan(hl_client, bankroll, bankroll_dict, is_dataclass,
                         send_message(
                             cfg.telegram.bot_token,
                             cfg.telegram.chat_id,
-                            "*EXECUTED* `" + sig_id + "`\n"
+                            "*EXECUTED (bracket)* `" + sig_id + "`\n"
                             + "notional=$" + "{:.2f}".format(
                                 pos.get("notional_usd", 0))
-                            + "\nentry oid=`" + str(pos["entry_oid"])
-                            + "`\nstop oid=`" + str(pos["stop_oid"]) + "`"
+                            + "\nentry=`" + str(pos["entry_oid"]) + "`"
+                            + "\nstop=`" + str(pos["stop_oid"]) + "`"
+                            + "\ntarget=`" + str(pos.get("target_oid")) + "`"
                         )
                     print("[" + pair + "] EXECUTED " + sig_id)
                 else:
@@ -560,10 +553,8 @@ def run() -> int:
         return 0
 
     try:
-        # Determine mode
         scan_mode = _should_run_scan(gist)
 
-        # Load bankroll
         try:
             bankroll = load_bankroll(gist, {
                 "initial_capital_usd": cfg.bankroll.initial_capital_usd
@@ -573,7 +564,6 @@ def run() -> int:
             _log_action(gist, "scan_error", {"error": str(e)[:200]})
             return 1
 
-        # To dict
         if hasattr(bankroll, "__dict__"):
             bankroll_dict = {
                 "equity_usd": getattr(bankroll, "equity_usd",
@@ -601,13 +591,11 @@ def run() -> int:
         else:
             print("[run] PAPER mode")
 
-        # ALWAYS reconcile first
         reconcile_events = []
         if hl_client and bankroll_dict.get("open_positions"):
             reconcile_events = _do_reconcile(hl_client, bankroll_dict,
                                               gist, cfg)
 
-        # Sync back to dataclass
         if is_dataclass:
             bankroll.equity_usd = bankroll_dict["equity_usd"]
             bankroll.peak_equity_usd = bankroll_dict["peak_equity_usd"]
@@ -616,7 +604,6 @@ def run() -> int:
             bankroll.halt_reason = bankroll_dict["halt_reason"]
             bankroll.open_positions = bankroll_dict["open_positions"]
 
-        # Run full scan if needed
         if scan_mode:
             print("[run] SCAN MODE (new 4h bar)")
             _log_action(gist, "scan_mode", {"mode": "full"})
@@ -629,7 +616,6 @@ def run() -> int:
             _log_action(gist, "reconcile_only", {
                 "n_events": len(reconcile_events),
             })
-            # Light heartbeat only if events
             if reconcile_events and cfg.telegram.enabled:
                 try:
                     msg = _format_light_heartbeat(bankroll_dict,
@@ -639,7 +625,6 @@ def run() -> int:
                 except Exception as e:
                     print("[run] light heartbeat failed: " + str(e))
 
-        # Sync final and persist
         if is_dataclass:
             bankroll.equity_usd = bankroll_dict["equity_usd"]
             bankroll.peak_equity_usd = bankroll_dict["peak_equity_usd"]
