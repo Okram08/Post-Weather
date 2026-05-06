@@ -1,0 +1,34 @@
+name: Reconcile
+
+on:
+  schedule:
+    # Every 10 minutes
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          pip install hyperliquid-python-sdk
+
+      - name: Run reconciler
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIST_PAT: ${{ secrets.GIST_PAT }}
+          GIST_STATE_ID: ${{ secrets.GIST_STATE_ID }}
+          HL_API_PRIVATE_KEY: ${{ secrets.HL_API_PRIVATE_KEY }}
+          HL_MAIN_ADDRESS: ${{ secrets.HL_MAIN_ADDRESS }}
+        run: python -m src.reconciler
