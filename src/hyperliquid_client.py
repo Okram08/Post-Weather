@@ -5,6 +5,7 @@ Wraps the official hyperliquid-python-sdk with safety guardrails:
   - HARDCODED max leverage (5x) - same
   - All orders idempotent via cloid (client order id)
   - Supports limit orders (entry) AND trigger orders (stop, target)
+  - Supports BRACKET orders: entry + SL + TP placed atomically (HL native)
 
 API wallet model:
   - api_private_key: signs the orders (the "agent" key, trade-only scope)
@@ -35,6 +36,11 @@ class HLLimitExceeded(Exception):
 
 
 class HyperliquidClient:
+    # Expose limits as class attrs so other modules (executor) can reference them
+    MAX_NOTIONAL_USD_PER_ORDER = MAX_NOTIONAL_USD_PER_ORDER
+    MAX_LEVERAGE_ALLOWED = MAX_LEVERAGE_ALLOWED
+    MIN_ORDER_USD = MIN_ORDER_USD
+
     def __init__(self, api_private_key: str, main_address: str,
                  testnet: bool = False):
         if not api_private_key:
@@ -266,6 +272,147 @@ class HyperliquidClient:
         return self.place_limit_order(
             coin=coin, is_buy=is_buy, sz=sz, limit_px=limit_px,
             reduce_only=True, cloid_str=cloid_str, post_only=True,
+        )
+
+    # ---- BRACKET ORDER: entry + SL + TP placed atomically ----
+
+    def place_bracket_order(self, coin: str, is_buy_entry: bool, sz: float,
+                             entry_px: float, stop_px: float, target_px: float,
+                             entry_cloid_str: Optional[str] = None,
+                             stop_cloid_str: Optional[str] = None,
+                             target_cloid_str: Optional[str] = None,
+                             post_only_entry: bool = True) -> dict:
+        """Place entry + SL + TP atomically using HL bracket order grouping.
+
+        Uses grouping="normalTpsl" so HL links the 3 orders:
+          - SL/TP only activate after entry fills
+          - Cancelling entry auto-cancels SL/TP
+          - HL handles linkage server-side, no race condition possible
+
+        Args:
+            coin: e.g. "BTC", "AVAX"
+            is_buy_entry: True for LONG, False for SHORT
+            sz: position size (in units of coin)
+            entry_px: limit price for the entry
+            stop_px: trigger price for stop loss
+            target_px: limit price for take profit
+            post_only_entry: True = ALO (Add Liquidity Only / post-only)
+                             False = GTC, may pay taker fee on immediate match
+
+        Returns:
+            dict from HL bulk_orders. Format:
+              {"status": "ok", "response": {"data": {"statuses": [
+                 <entry status>, <stop status>, <target status>
+              ]}}}
+            Each status has "resting": {"oid": ...} on success or "error": "..." on fail.
+        """
+        # Validate notional (use entry price for sizing)
+        notional = abs(sz * entry_px)
+        if notional > MAX_NOTIONAL_USD_PER_ORDER:
+            raise HLLimitExceeded(
+                "bracket notional ${:.2f} > max ${:.2f}".format(
+                    notional, MAX_NOTIONAL_USD_PER_ORDER))
+        if notional < MIN_ORDER_USD:
+            raise HLLimitExceeded(
+                "bracket notional ${:.2f} < min ${:.2f}".format(
+                    notional, MIN_ORDER_USD))
+        if sz <= 0:
+            raise HLLimitExceeded("size must be > 0")
+        if entry_px <= 0 or stop_px <= 0 or target_px <= 0:
+            raise HLLimitExceeded("all prices must be > 0")
+
+        # Sanity: prices within reasonable range vs mark
+        try:
+            mark = self.get_mark_price(coin)
+            for label, px in (("entry", entry_px), ("stop", stop_px),
+                              ("target", target_px)):
+                if abs(px - mark) / mark > 0.5:
+                    raise HLLimitExceeded(
+                        "{} px {:.4f} differs >50% from mark {:.4f}".format(
+                            label, px, mark))
+        except HLLimitExceeded:
+            raise
+        except Exception:
+            pass
+
+        # SL/TP exit side is opposite of entry
+        is_buy_exit = not is_buy_entry
+
+        # Generate cloids if not provided
+        if entry_cloid_str is None:
+            entry_cloid_str = "0x" + uuid.uuid4().hex
+        if stop_cloid_str is None:
+            stop_cloid_str = "0x" + uuid.uuid4().hex
+        if target_cloid_str is None:
+            target_cloid_str = "0x" + uuid.uuid4().hex
+
+        # ENTRY: limit order, ALO (post-only) or GTC
+        entry_tif = "Alo" if post_only_entry else "Gtc"
+        entry_order = {
+            "coin": coin,
+            "is_buy": is_buy_entry,
+            "sz": sz,
+            "limit_px": entry_px,
+            "order_type": {"limit": {"tif": entry_tif}},
+            "reduce_only": False,
+            "cloid": Cloid.from_str(entry_cloid_str),
+        }
+
+        # SL: trigger market reduce-only
+        # For a stop on a SHORT (is_buy_exit=True, closing short): slippage UP
+        # For a stop on a LONG  (is_buy_exit=False, closing long):  slippage DOWN
+        if is_buy_exit:
+            sl_slippage_limit = stop_px * 1.20
+        else:
+            sl_slippage_limit = stop_px * 0.80
+
+        stop_order = {
+            "coin": coin,
+            "is_buy": is_buy_exit,
+            "sz": sz,
+            "limit_px": sl_slippage_limit,
+            "order_type": {
+                "trigger": {
+                    "triggerPx": stop_px,
+                    "isMarket": True,
+                    "tpsl": "sl",
+                }
+            },
+            "reduce_only": True,
+            "cloid": Cloid.from_str(stop_cloid_str),
+        }
+
+        # TP: trigger LIMIT reduce-only (limit fills as a maker order at target_px)
+        target_order = {
+            "coin": coin,
+            "is_buy": is_buy_exit,
+            "sz": sz,
+            "limit_px": target_px,
+            "order_type": {
+                "trigger": {
+                    "triggerPx": target_px,
+                    "isMarket": False,
+                    "tpsl": "tp",
+                }
+            },
+            "reduce_only": True,
+            "cloid": Cloid.from_str(target_cloid_str),
+        }
+
+        print("[hl_client] place_bracket_order: " + coin
+              + (" LONG " if is_buy_entry else " SHORT ")
+              + "sz=" + str(sz)
+              + " entry=$" + str(entry_px)
+              + " sl=$" + str(stop_px)
+              + " tp=$" + str(target_px)
+              + " notional=${:.2f}".format(notional)
+              + " post_only=" + str(post_only_entry))
+
+        # Place all 3 in one bulk_orders call with grouping="normalTpsl".
+        # HL processes them atomically: if any fails validation, none are placed.
+        return self.exchange.bulk_orders(
+            [entry_order, stop_order, target_order],
+            grouping="normalTpsl",
         )
 
     # ---- Cancel ----
