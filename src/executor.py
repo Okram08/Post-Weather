@@ -3,14 +3,10 @@
 Bridges scanner -> HL: when scanner detects a Setup A signal AND the bankroll
 gates pass, executor.execute_signal() is called.
 
-NOTIONAL CAP (per trade) = MIN of:
-  1. equity * MAX_NOTIONAL_PCT_PER_TRADE  (HARDCODED 20%)
-  2. equity * max_leverage (from config, 1.0 = no leverage)
-  3. EXECUTOR_HARD_NOTIONAL_CEILING (HARDCODED $500 absolute floor)
-This guarantees:
-  - No single trade > 20% of bankroll
-  - No leverage above config setting
-  - Even with bug, notional capped at $500 absolute
+NOTIONAL CAP per trade = MIN of:
+  1. equity * MAX_NOTIONAL_PCT_PER_TRADE  (20%)
+  2. equity * max_leverage (from config, 1.0 = spot equivalent)
+  3. EXECUTOR_HARD_NOTIONAL_CEILING ($500 absolute floor)
 """
 import os
 import uuid
@@ -21,7 +17,7 @@ from src.hyperliquid_client import HyperliquidClient, HLLimitExceeded
 
 
 # ===== EXECUTOR LIMITS =====
-MAX_NOTIONAL_PCT_PER_TRADE = 0.20    # max 20% of bankroll per single trade
+MAX_NOTIONAL_PCT_PER_TRADE = 0.20
 EXECUTOR_HARD_NOTIONAL_CEILING = 500.0
 ENTRY_VALIDITY_HOURS = 8
 POSITION_MAX_HOURS = 48
@@ -29,18 +25,56 @@ HL_MIN_NOTIONAL = 10.0
 # ============================
 
 
+# ===== Per-coin precision tables =====
+# These come from HL's `meta` endpoint. The bot loads them statically
+# to avoid an extra RPC call. If HL changes szDecimals for a coin, update here.
+# Source: app.hyperliquid.xyz -> coin info, or info/meta API.
+SIZE_DECIMALS = {
+    "BTC":   5,    # 0.00001 BTC step
+    "ETH":   4,    # 0.0001 ETH step
+    "SOL":   2,    # 0.01 SOL step
+    "HYPE":  2,    # 0.01 HYPE step
+    "AVAX":  2,    # 0.01 AVAX step
+    "LINK":  1,    # 0.1 LINK step
+    "ARB":   1,    # 0.1 ARB step
+    "OP":    1,    # 0.1 OP step
+    "POL":   1,    # 0.1 POL step
+    "MATIC": 1,    # legacy alias for POL
+}
+
+# Price tick: HL uses 5 significant digits + max 6 decimals.
+# Conservative tick chosen per asset so we never get rejected for too-fine prices.
+PRICE_TICK = {
+    "BTC":   1.0,    # whole dollar
+    "ETH":   0.1,    # 10 cents
+    "SOL":   0.01,   # 1 cent
+    "HYPE":  0.01,
+    "AVAX":  0.01,
+    "LINK":  0.001,  # tenth of cent
+    "ARB":   0.0001,
+    "OP":    0.001,
+    "POL":   0.0001,
+    "MATIC": 0.0001,
+}
+
+# Default fallback if coin is not in the tables above
+DEFAULT_SIZE_DECIMALS = 2
+DEFAULT_PRICE_TICK = 0.01
+
+
 def pair_to_coin(pair: str) -> str:
+    """'BTC/USDC:USDC' -> 'BTC'."""
     return pair.split("/")[0]
 
 
 def _round_size(coin: str, sz: float) -> float:
-    decimals = {"BTC": 5, "ETH": 4, "SOL": 2}.get(coin, 4)
+    decimals = SIZE_DECIMALS.get(coin, DEFAULT_SIZE_DECIMALS)
     return round(sz, decimals)
 
 
 def _round_price(coin: str, px: float) -> float:
-    tick = {"BTC": 1.0, "ETH": 0.1, "SOL": 0.01}.get(coin, 0.01)
-    return round(round(px / tick) * tick, 6)
+    tick = PRICE_TICK.get(coin, DEFAULT_PRICE_TICK)
+    return round(round(px / tick) * tick, 8)
 
 
 def make_client_from_env() -> Optional[HyperliquidClient]:
@@ -89,12 +123,11 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
     max_leverage = float(bankroll_state.get("_max_leverage", 1.0))
 
     # ===== NOTIONAL CAPS =====
-    pct_cap = equity * MAX_NOTIONAL_PCT_PER_TRADE  # 20% per trade
-    leverage_cap = equity * max_leverage             # leverage cap
+    pct_cap = equity * MAX_NOTIONAL_PCT_PER_TRADE
+    leverage_cap = equity * max_leverage
     effective_cap = min(pct_cap, leverage_cap, EXECUTOR_HARD_NOTIONAL_CEILING)
 
     if notional > effective_cap:
-        # Identify which cap is binding for clarity in logs
         if pct_cap == effective_cap:
             cap_reason = "20% per trade cap"
         elif leverage_cap == effective_cap:
@@ -110,14 +143,13 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
                 "reason": "notional ${:.2f} below HL min ${:.2f} after caps".format(
                     notional, HL_MIN_NOTIONAL)}
 
-    # Verify final leverage
     leverage_used = notional / equity if equity > 0 else 0
     if leverage_used > max_leverage + 0.01:
         return {"ok": False,
                 "reason": "leverage {:.2f}x > max {:.1f}x".format(
                     leverage_used, max_leverage)}
 
-    # Concurrent position cap (executor reads from bankroll state)
+    # Concurrent position cap
     open_positions = bankroll_state.get("open_positions", []) or []
     active = [p for p in open_positions if p.get("status") not in ("closed",)]
     max_concurrent = int(bankroll_state.get("_max_concurrent_positions", 5))
@@ -134,11 +166,18 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
                 "reason": "computed size {} <= 0 from notional ${:.2f} / px ${:.4f}".format(
                     size, notional, limit_px)}
 
+    # Recompute notional with rounded size and check we still meet HL min
+    actual_notional = size * limit_px
+    if actual_notional < HL_MIN_NOTIONAL:
+        return {"ok": False,
+                "reason": "after size rounding, notional ${:.2f} < HL min ${:.2f}".format(
+                    actual_notional, HL_MIN_NOTIONAL)}
+
     # Direction flags
     entry_is_buy = (direction == "long")
     exit_is_buy = (direction == "short")
 
-    # Generate cloids derived from signal_id
+    # Generate cloids
     sig_hash = signal.signal_id.replace("-", "").replace("_", "")[:24].lower()
     sig_hash = "".join(c if c in "0123456789abcdef" else "0" for c in sig_hash)
     sig_hash = sig_hash.ljust(24, "0")
@@ -151,11 +190,11 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
         entry_cloid = "0x" + uuid.uuid4().hex
         stop_cloid = "0x" + uuid.uuid4().hex
 
-    # Place ENTRY (limit, post-only)
+    # Place ENTRY
     print("[executor] placing ENTRY for " + signal.signal_id
           + " " + direction + " " + coin
           + " size=" + str(size) + " limit=$" + str(limit_px)
-          + " notional=${:.2f} lev={:.2f}x".format(notional, leverage_used))
+          + " notional=${:.2f} lev={:.2f}x".format(actual_notional, leverage_used))
     try:
         entry_result = client.place_limit_order(
             coin=coin, is_buy=entry_is_buy, sz=size, limit_px=limit_px,
@@ -172,7 +211,7 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
         return {"ok": False,
                 "reason": "entry failed: " + (err or str(entry_result)[:300])}
 
-    # Place STOP (trigger market, reduce_only)
+    # Place STOP
     print("[executor] placing STOP for " + signal.signal_id
           + " trigger=$" + str(stop_px))
     stop_oid = None
@@ -202,7 +241,7 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
         "coin": coin,
         "direction": direction,
         "size": size,
-        "notional_usd": round(notional, 4),
+        "notional_usd": round(actual_notional, 4),
         "leverage_used": round(leverage_used, 4),
         "entry_oid": entry_oid,
         "stop_oid": stop_oid,
@@ -260,7 +299,6 @@ def reconcile_positions(client: HyperliquidClient,
         except Exception:
             age_h = 0.0
 
-        # Status: pending_entry
         if status == "pending_entry":
             entry_oid = pos.get("entry_oid")
             entry_still_open = entry_oid in open_oids
@@ -292,7 +330,6 @@ def reconcile_positions(client: HyperliquidClient,
                     new_open.append(pos)
                     continue
             else:
-                # Entry no longer open -> filled or vanished
                 hl_pos = hl_pos_by_coin.get(coin)
                 if hl_pos and abs(hl_pos["size"]) >= pos["size"] * 0.95:
                     fill_px = hl_pos.get("entry_price", pos["limit_price"])
@@ -305,7 +342,6 @@ def reconcile_positions(client: HyperliquidClient,
                         "fill_price": fill_px,
                     })
 
-                    # Place target
                     try:
                         exit_is_buy = (pos["direction"] == "short")
                         target_cloid = "0x" + uuid.uuid4().hex
@@ -338,7 +374,6 @@ def reconcile_positions(client: HyperliquidClient,
                     })
                     continue
 
-        # Status: open
         if status == "open":
             hl_pos = hl_pos_by_coin.get(coin)
             stop_oid = pos.get("stop_oid")
@@ -348,7 +383,6 @@ def reconcile_positions(client: HyperliquidClient,
             target_still_open = target_oid in open_oids if target_oid else False
 
             if not hl_pos or abs(hl_pos.get("size", 0)) < 1e-9:
-                # Position closed
                 exit_reason = "unknown"
                 if target_oid and not target_still_open:
                     exit_reason = "target_hit"
@@ -370,7 +404,6 @@ def reconcile_positions(client: HyperliquidClient,
                 else:
                     pnl_per_unit = pos["limit_price"] - exit_px
                 pnl_usd = pnl_per_unit * pos["size"]
-                # Estimated fees
                 entry_fee = pos["notional_usd"] * 0.000144
                 if exit_reason == "stop_hit":
                     exit_fee = pos["notional_usd"] * 0.000432
@@ -384,7 +417,6 @@ def reconcile_positions(client: HyperliquidClient,
                 pos["exit_price"] = round(exit_px, 4)
                 pos["realized_pnl_usd"] = round(pnl_usd, 4)
 
-                # Cancel any remaining orders
                 for oid_field in ["stop_oid", "target_oid"]:
                     other = pos.get(oid_field)
                     if other and other in open_oids:
@@ -403,7 +435,6 @@ def reconcile_positions(client: HyperliquidClient,
                     "pnl_usd": pos["realized_pnl_usd"],
                 })
 
-                # Update bankroll equity
                 bankroll_state["equity_usd"] = (
                     bankroll_state.get("equity_usd", 0.0) + pos["realized_pnl_usd"]
                 )
@@ -416,7 +447,6 @@ def reconcile_positions(client: HyperliquidClient,
                 )
                 continue
 
-            # Position still open -> check timeout
             try:
                 filled_dt = datetime.fromisoformat(pos["filled_at"])
                 hold_h = (now - filled_dt).total_seconds() / 3600.0
