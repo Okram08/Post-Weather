@@ -39,7 +39,7 @@ bankroll:
   initial_capital_usd: 100.0
   risk_per_trade_pct: 0.004        # 0.4% -> ~$20 notional, capped at 20%
   max_concurrent_positions: 5
-  max_leverage: 1.0                # spot-equivalent
+  max_leverage: 1.5                # spot-equivalent
 
   daily_loss_limit_pct: 0.05
   max_drawdown_pct: 0.20
