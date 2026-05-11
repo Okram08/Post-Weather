@@ -1,19 +1,13 @@
 """Hyperliquid execution layer with BRACKET ORDERS.
 
-KEY CHANGE FROM v1: uses place_bracket_order() to place entry+SL+TP atomically
-via HL's native normalTpsl grouping. This means:
-  - TP is armed instantly when entry fills (no 30min delay)
-  - HL handles TP/SL linkage to entry (auto-cancel if entry expires)
-  - reconcile is simpler: just detects state transitions
-
 NOTIONAL CAP per trade = MIN of:
-  1. equity * MAX_NOTIONAL_PCT_PER_TRADE  (20%)
-  2. equity * max_leverage (1.0 = spot equivalent)
+  1. equity * MAX_NOTIONAL_PCT_PER_TRADE  (30% - was 20%, bumped 2026-05-11)
+  2. equity * max_leverage (1.5 - was 1.0, bumped 2026-05-11)
   3. EXECUTOR_HARD_NOTIONAL_CEILING ($500 absolute floor)
 
 SAFETY GUARANTEES:
-  - Bracket order is atomic at HL level: if any of entry/SL/TP fails, none placed.
-  - reconcile_positions() still detects naked positions as belt-and-suspenders.
+  - Bracket order is atomic at HL level
+  - reconcile_positions() detects naked positions as belt-and-suspenders
 """
 import json
 import os
@@ -25,7 +19,7 @@ from src.hyperliquid_client import HyperliquidClient, HLLimitExceeded
 
 
 # ===== EXECUTOR LIMITS =====
-MAX_NOTIONAL_PCT_PER_TRADE = 0.30
+MAX_NOTIONAL_PCT_PER_TRADE = 0.30        # was 0.20, bumped 2026-05-11
 EXECUTOR_HARD_NOTIONAL_CEILING = 500.0
 ENTRY_VALIDITY_HOURS = 8
 POSITION_MAX_HOURS = 48
@@ -77,10 +71,6 @@ def make_client_from_env() -> Optional[HyperliquidClient]:
 
 
 def _extract_oids_from_bracket(result: dict) -> dict:
-    """Parse bulk_orders response with 3 statuses (entry, SL, TP).
-
-    Returns {"entry_oid": int, "stop_oid": int, "target_oid": int} or None entries.
-    """
     out = {"entry_oid": None, "stop_oid": None, "target_oid": None}
     if not isinstance(result, dict) or result.get("status") != "ok":
         return out
@@ -104,7 +94,6 @@ def _extract_oids_from_bracket(result: dict) -> dict:
 
 
 def _extract_bracket_error(result: dict) -> Optional[str]:
-    """Find the first error in a bracket bulk_orders response."""
     if not isinstance(result, dict):
         return "non-dict result"
     if result.get("status") != "ok":
@@ -123,7 +112,6 @@ def _extract_bracket_error(result: dict) -> Optional[str]:
 
 def execute_signal(client: HyperliquidClient, signal, sizing,
                    bankroll_state: dict) -> dict:
-    """Place entry + SL + TP atomically via HL bracket order."""
     coin = pair_to_coin(signal.pair)
     direction = signal.direction
     limit_px = _round_price(coin, signal.limit_price)
@@ -147,7 +135,7 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
 
     notional = float(sizing.notional_usd)
     equity = float(bankroll_state.get("equity_usd", 0.0))
-    max_leverage = float(bankroll_state.get("_max_leverage", 1.0))
+    max_leverage = float(bankroll_state.get("_max_leverage", 1.5))
 
     pct_cap = equity * MAX_NOTIONAL_PCT_PER_TRADE
     leverage_cap = equity * max_leverage
@@ -155,7 +143,7 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
 
     if notional > effective_cap:
         if pct_cap == effective_cap:
-            cap_reason = "20% per trade cap"
+            cap_reason = "{:.0%} per trade cap".format(MAX_NOTIONAL_PCT_PER_TRADE)
         elif leverage_cap == effective_cap:
             cap_reason = "{}x leverage cap".format(max_leverage)
         else:
@@ -197,7 +185,6 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
 
     is_buy_entry = (direction == "long")
 
-    # Generate cloids
     sig_hash = signal.signal_id.replace("-", "").replace("_", "")[:24].lower()
     sig_hash = "".join(c if c in "0123456789abcdef" else "0" for c in sig_hash)
     sig_hash = sig_hash.ljust(24, "0")
@@ -214,7 +201,6 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
     stop_cloid = _make_cloid("1")
     target_cloid = _make_cloid("2")
 
-    # Place bracket order (entry + SL + TP atomically)
     print("[executor] placing BRACKET for " + signal.signal_id
           + " " + direction + " " + coin
           + " size=" + str(size)
@@ -238,7 +224,6 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
     except Exception as e:
         return {"ok": False, "reason": "bracket exception: " + str(e)[:200]}
 
-    # Parse oids
     oids = _extract_oids_from_bracket(result)
     if oids["entry_oid"] is None:
         err = _extract_bracket_error(result) or "no oid"
@@ -246,9 +231,6 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
                 "reason": "bracket failed: " + err
                           + " | raw: " + json.dumps(result)[:300]}
 
-    # If stop or target oid missing, that's a problem - log it, but at least
-    # the entry was placed. The HL bracket SHOULD always return all 3 if the
-    # whole thing succeeds, so this is a safety check.
     if oids["stop_oid"] is None or oids["target_oid"] is None:
         print("[executor] WARNING bracket returned partial oids: "
               + str(oids) + " | raw: " + json.dumps(result)[:300])
@@ -284,7 +266,6 @@ def execute_signal(client: HyperliquidClient, signal, sizing,
 
 
 def _try_place_replacement_stop(client, pos):
-    """Place a standalone stop for a position that lost its protection."""
     coin = pos.get("coin", pair_to_coin(pos.get("pair", "")))
     direction = pos.get("direction", "long")
     exit_is_buy = (direction == "short")
@@ -295,7 +276,6 @@ def _try_place_replacement_stop(client, pos):
             coin=coin, is_buy=exit_is_buy, sz=pos["size"],
             trigger_px=stop_px, cloid_str=new_cloid,
         )
-        # Re-use the old extract logic
         if not isinstance(result, dict) or result.get("status") != "ok":
             return False, "bad result: " + str(result)[:200]
         statuses = result.get("response", {}).get("data", {}).get("statuses", [])
@@ -342,15 +322,6 @@ def _force_close_market(client, pos):
 
 def reconcile_positions(client: HyperliquidClient,
                         bankroll_state: dict) -> list:
-    """Reconcile open positions, transition state, return events.
-
-    With bracket orders, TP is already placed. So reconcile mostly:
-      - Detects entry fills -> mark position as 'open'
-      - Detects exits (stop/target hit) -> close, compute PnL, update bankroll
-      - Detects expired entries (8h) -> cancel
-      - Detects timeouts (48h) -> force-close
-      - Detects naked positions (rare with bracket) -> safety net
-    """
     events = []
     open_positions = bankroll_state.get("open_positions", []) or []
     if not open_positions:
@@ -384,7 +355,6 @@ def reconcile_positions(client: HyperliquidClient,
         except Exception:
             age_h = 0.0
 
-        # --- pending_entry: waiting for fill ---
         if status == "pending_entry":
             entry_oid = pos.get("entry_oid")
             entry_still_open = entry_oid in open_oids if entry_oid else False
@@ -393,7 +363,6 @@ def reconcile_positions(client: HyperliquidClient,
                             abs(hl_pos.get("size", 0)) >= pos["size"] * 0.95)
 
             if entry_filled:
-                # Filled! Mark as open. With bracket order, TP is already placed.
                 fill_px = hl_pos.get("entry_price", pos["limit_price"])
                 pos["status"] = "open"
                 pos["filled_at"] = now.isoformat()
@@ -403,7 +372,6 @@ def reconcile_positions(client: HyperliquidClient,
                     "signal_id": sig_id,
                     "fill_price": fill_px,
                 })
-                # Verify TP/SL still in book (safety check)
                 stop_alive = pos.get("stop_oid") in open_oids
                 target_alive = pos.get("target_oid") in open_oids
                 if not stop_alive:
@@ -423,7 +391,6 @@ def reconcile_positions(client: HyperliquidClient,
                 continue
 
             if entry_still_open:
-                # Still pending, check expiry
                 if age_h > ENTRY_VALIDITY_HOURS:
                     print("[reconcile] " + sig_id
                           + " entry expired age={:.1f}h, cancelling".format(age_h))
@@ -431,8 +398,6 @@ def reconcile_positions(client: HyperliquidClient,
                         client.cancel_order(coin, entry_oid)
                     except Exception as e:
                         print("[reconcile] cancel entry: " + str(e))
-                    # With bracket, cancelling entry should auto-cancel SL/TP.
-                    # But we cancel them explicitly too, just in case.
                     for oid_field in ["stop_oid", "target_oid"]:
                         oid = pos.get(oid_field)
                         if oid and oid in open_oids:
@@ -454,7 +419,6 @@ def reconcile_positions(client: HyperliquidClient,
                     new_open.append(pos)
                     continue
 
-            # Entry oid not in book, no position -> vanished
             print("[reconcile] " + sig_id + " entry vanished (no oid, no pos)")
             for oid_field in ["stop_oid", "target_oid"]:
                 oid = pos.get(oid_field)
@@ -470,7 +434,6 @@ def reconcile_positions(client: HyperliquidClient,
             events.append({"event": "entry_vanished", "signal_id": sig_id})
             continue
 
-        # --- open: position is live ---
         if status == "open":
             hl_pos = hl_pos_by_coin.get(coin)
             stop_oid = pos.get("stop_oid")
@@ -478,7 +441,6 @@ def reconcile_positions(client: HyperliquidClient,
             stop_alive = stop_oid in open_oids if stop_oid else False
             target_alive = target_oid in open_oids if target_oid else False
 
-            # Naked safety net: position open but no protection orders
             if hl_pos and abs(hl_pos.get("size", 0)) > 0 and not stop_alive:
                 print("[reconcile] " + sig_id
                       + " OPEN with NO stop, replacing")
@@ -521,7 +483,6 @@ def reconcile_positions(client: HyperliquidClient,
                     })
                     continue
 
-            # Check if position closed
             if not hl_pos or abs(hl_pos.get("size", 0)) < 1e-9:
                 exit_reason = "unknown"
                 if target_oid and not target_alive:
@@ -557,7 +518,6 @@ def reconcile_positions(client: HyperliquidClient,
                 pos["exit_price"] = round(exit_px, 4)
                 pos["realized_pnl_usd"] = round(pnl_usd, 4)
 
-                # Cancel the remaining protective order
                 for oid_field in ["stop_oid", "target_oid"]:
                     other = pos.get(oid_field)
                     if other and other in open_oids:
@@ -586,7 +546,6 @@ def reconcile_positions(client: HyperliquidClient,
                     + pos["realized_pnl_usd"])
                 continue
 
-            # Check 48h timeout
             try:
                 filled_dt = datetime.fromisoformat(pos["filled_at"])
                 hold_h = (now - filled_dt).total_seconds() / 3600.0
