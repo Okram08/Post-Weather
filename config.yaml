@@ -1,9 +1,10 @@
 # crypto-trading-bot configuration
-# Spot-equivalent mode (leverage 1.0x on Hyperliquid Perps)
-# - 9 pairs scanned: 3 majors + 6 alts
-# - Max 20% of bankroll per single trade
-# - Up to 5 concurrent positions
-# - Min order $10 (HL exchange limit)
+# After 2 wins + 2 losses live, slight bump in sizing.
+# - 30% of bankroll per single trade (up from 20%)
+# - 5 concurrent positions max
+# - Leverage cap 1.5x (up from 1.0x = spot equivalent)
+#   Note: 5 positions x 30% = 150% notional total = 1.5x leverage if all 5 fire.
+#   In practice it's rare to have 5 simultaneous, so avg leverage stays around 0.4x-0.9x.
 
 strategy:
   pairs:
@@ -18,7 +19,7 @@ strategy:
     # Tier 3 : L2s
     - "ARB/USDC:USDC"
     - "OP/USDC:USDC"
-    - "POL/USDC:USDC"        # if HL still uses MATIC, change to "MATIC/USDC:USDC"
+    - "POL/USDC:USDC"
 
   setup_a:
     setup_atr_extension: 1.0
@@ -37,9 +38,9 @@ strategy:
 
 bankroll:
   initial_capital_usd: 100.0
-  risk_per_trade_pct: 0.004        # 0.4% -> ~$20 notional, capped at 20%
+  risk_per_trade_pct: 0.004
   max_concurrent_positions: 5
-  max_leverage: 1.5                # spot-equivalent
+  max_leverage: 1.5                # was 1.0, now allows up to 5 positions x 30%
 
   daily_loss_limit_pct: 0.05
   max_drawdown_pct: 0.20
